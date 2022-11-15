@@ -26,7 +26,7 @@ subprocess.run([cmd], shell=True, check=True)
 # Validate wilds
 cmd = "python validate_ffhq.py"
 subprocess.run([cmd], shell=True, check=True)
-
+'''
 #--------------------------------------------------------------------------------------------------------#
 
 # Align wilds
@@ -75,3 +75,4 @@ print("Creating dataset zip...")
 cmd = f"python {os.path.join(dir_path, '../../eg3d', 'dataset_tool.py')}"
 cmd += f" --source=final_crops --dest FFHQ_512.zip --resolution 512x512"
 subprocess.run([cmd], shell=True, check=True)
+'''

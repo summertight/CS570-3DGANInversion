@@ -308,19 +308,26 @@ class SynthesisLayer(torch.nn.Module):
             self.noise_strength = torch.nn.Parameter(torch.zeros([]))
         self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
 
-    def forward(self, x, w, noise_mode='random', fused_modconv=True, gain=1):
-        assert noise_mode in ['random', 'const', 'none']
+    def forward(self, x, w, map = None, noise_mode='random', fused_modconv=True, gain=1):
+        assert noise_mode in ['random', 'const', 'none', 'param']
         in_resolution = self.resolution // self.up
         misc.assert_shape(x, [None, self.in_channels, in_resolution, in_resolution])
         styles = self.affine(w)
 
         noise = None
-        if self.use_noise and noise_mode == 'random':
-            noise = torch.randn([x.shape[0], 1, self.resolution, self.resolution], device=x.device) * self.noise_strength
-        if self.use_noise and noise_mode == 'const':
-            noise = self.noise_const * self.noise_strength
 
+        if (self.use_noise) and (map is not None):
+            noise = map * self.noise_strength
+        elif self.use_noise and noise_mode == 'random':
+            noise = torch.randn([x.shape[0], 1, self.resolution, self.resolution], device=x.device) * self.noise_strength
+        elif self.use_noise and noise_mode == 'const':
+            noise = self.noise_const * self.noise_strength
+        
+            
+      
+        #print()
         flip_weight = (self.up == 1) # slightly faster
+        #print(x.shape, 'x.shape')
         x = modulated_conv2d(x=x, weight=self.weight, styles=styles, noise=noise, up=self.up,
             padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv)
 
@@ -414,8 +421,9 @@ class SynthesisBlock(torch.nn.Module):
             self.skip = Conv2dLayer(in_channels, out_channels, kernel_size=1, bias=False, up=2,
                 resample_filter=resample_filter, channels_last=self.channels_last)
 
-    def forward(self, x, img, ws, force_fp32=False, fused_modconv=None, update_emas=False, **layer_kwargs):
+    def forward(self, x, img, ws, block_maps=None, force_fp32=False, fused_modconv=None, update_emas=False, **layer_kwargs):
         _ = update_emas # unused
+        #import pdb;pdb.set_trace()
         misc.assert_shape(ws, [None, self.num_conv + self.num_torgb, self.w_dim])
         w_iter = iter(ws.unbind(dim=1))
         if ws.device.type != 'cuda':
@@ -436,16 +444,34 @@ class SynthesisBlock(torch.nn.Module):
             x = x.to(dtype=dtype, memory_format=memory_format)
 
         # Main layers.
-        if self.in_channels == 0:
-            x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
-        elif self.architecture == 'resnet':
-            y = self.skip(x, gain=np.sqrt(0.5))
-            x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
-            x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, gain=np.sqrt(0.5), **layer_kwargs)
-            x = y.add_(x)
+        #import pdb;pdb.set_trace()
+        if block_maps is not None:
+            if self.in_channels == 0:
+                x = self.conv1(x, next(w_iter), block_maps[0], fused_modconv=fused_modconv, **layer_kwargs)
+            elif self.architecture == 'resnet':
+                y = self.skip(x, gain=np.sqrt(0.5))
+                x = self.conv0(x, next(w_iter), block_maps[0], fused_modconv=fused_modconv, **layer_kwargs)
+                x = self.conv1(x, next(w_iter), block_maps[1], fused_modconv=fused_modconv, gain=np.sqrt(0.5), **layer_kwargs)
+                x = y.add_(x)
+            else:
+                x = self.conv0(x, next(w_iter), block_maps[0], fused_modconv=fused_modconv, **layer_kwargs)
+                x = self.conv1(x, next(w_iter), block_maps[1], fused_modconv=fused_modconv, **layer_kwargs)
+
         else:
-            x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
-            x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+
+            if self.in_channels == 0:
+                x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+  
+            elif self.architecture == 'resnet':
+                y = self.skip(x, gain=np.sqrt(0.5))
+                x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+
+                x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, gain=np.sqrt(0.5), **layer_kwargs)
+
+                x = y.add_(x)
+            else:
+                x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+                x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
 
         # ToRGB.
         if img is not None:
@@ -486,7 +512,7 @@ class SynthesisNetwork(torch.nn.Module):
         self.block_resolutions = [2 ** i for i in range(2, self.img_resolution_log2 + 1)]
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions}
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
-
+        #print(self.w_dim,"wdim")
         self.num_ws = 0
         for res in self.block_resolutions:
             in_channels = channels_dict[res // 2] if res > 4 else 0
@@ -500,21 +526,60 @@ class SynthesisNetwork(torch.nn.Module):
                 self.num_ws += block.num_torgb
             setattr(self, f'b{res}', block)
 
-    def forward(self, ws, **block_kwargs):
+    def forward(self, ws, maps = None,  **block_kwargs):
         block_ws = []
+        
         with torch.autograd.profiler.record_function('split_ws'):
-            misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
-            ws = ws.to(torch.float32)
-            w_idx = 0
-            for res in self.block_resolutions:
-                block = getattr(self, f'b{res}')
-                block_ws.append(ws.narrow(1, w_idx, block.num_conv + block.num_torgb))
-                w_idx += block.num_conv
+            #breakpoint()
+            if ws.shape[1] == 14:#w+
+                misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
+                ws = ws.to(torch.float32)
+                w_idx = 0
+                for res in self.block_resolutions:
+                    block = getattr(self, f'b{res}')
+                    block_ws.append(ws.narrow(1, w_idx, block.num_conv + block.num_torgb))
+                    #print(block.num_conv, block.num_torgb)
+                    w_idx += block.num_conv
+            else:#W++
+                misc.assert_shape(ws, [None, self.num_ws//2*3-1, self.w_dim])
+                ws = ws.to(torch.float32)
+                for res in self.block_resolutions:
+                    res = int(res)
+                    #import pdb;pdb.set_trace()
+                    if res == 4:
+                        block_ws.append(ws.narrow(1, 0, 2))
+                    else:
+                        
+                        block_ws.append(ws.narrow(1, int(np.log2(res))*3-7 , 3))
+                        #print(ws.narrow(1, int(np.log2(res))*3-7 , 3).shape)
+                    #print(np.log2(res)*3-7,np.log2(res)*3-4)
+                    #import pdb;pdb.set_trace()
+                
+            
+        #import pdb;pdb.set_trace()
+        #import pdb;pdb.set_trace()
+        
 
-        x = img = None
-        for res, cur_ws in zip(self.block_resolutions, block_ws):
-            block = getattr(self, f'b{res}')
-            x, img = block(x, img, cur_ws, **block_kwargs)
+        x = img = None  
+        if maps is not None:
+            map_iter = iter(maps)
+            for res, cur_ws in zip(self.block_resolutions, block_ws):
+                block = getattr(self, f'b{res}')
+                block_maps = []
+                if res == 4:
+                    block_maps.append(next(map_iter))
+                else:
+                    block_maps.append(next(map_iter))
+                    block_maps.append(next(map_iter))
+                #print(map_list.__len__())
+                #print(block.architecture, block.in_channels, cur_ws.shape)
+                x, img = block(x, img, cur_ws, block_maps, **block_kwargs)
+        else:
+            #x = img = None
+            for res, cur_ws in zip(self.block_resolutions, block_ws):
+                block = getattr(self, f'b{res}')
+                x, img = block(x, img, cur_ws, **block_kwargs)
+            #import pdb;pdb.set_trace()
         return img
 
     def extra_repr(self):
@@ -548,6 +613,7 @@ class Generator(torch.nn.Module):
 
     def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
+        #import pdb;pdb.set_trace()
         img = self.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
         return img
 

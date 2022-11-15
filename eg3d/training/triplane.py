@@ -50,7 +50,7 @@ class TriPlaneGenerator(torch.nn.Module):
                 c = torch.zeros_like(c)
         return self.backbone.mapping(z, c * self.rendering_kwargs.get('c_scale', 0), truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
 
-    def synthesis(self, ws, c, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
+    def synthesis(self, ws, maps=None, c=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
         cam2world_matrix = c[:, :16].view(-1, 4, 4)
         intrinsics = c[:, 16:25].view(-1, 3, 3)
 
@@ -67,7 +67,7 @@ class TriPlaneGenerator(torch.nn.Module):
         if use_cached_backbone and self._last_planes is not None:
             planes = self._last_planes
         else:
-            planes = self.backbone.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
+            planes = self.backbone.synthesis(ws, maps, update_emas=update_emas, **synthesis_kwargs)
         if cache_backbone:
             self._last_planes = planes
 
@@ -104,7 +104,7 @@ class TriPlaneGenerator(torch.nn.Module):
     def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
         # Render a batch of generated images.
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
-        return self.synthesis(ws, c, update_emas=update_emas, neural_rendering_resolution=neural_rendering_resolution, cache_backbone=cache_backbone, use_cached_backbone=use_cached_backbone, **synthesis_kwargs)
+        return self.synthesis(ws, None, c, update_emas=update_emas, neural_rendering_resolution=neural_rendering_resolution, cache_backbone=cache_backbone, use_cached_backbone=use_cached_backbone, **synthesis_kwargs)
 
 
 from training.networks_stylegan2 import FullyConnectedLayer

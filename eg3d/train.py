@@ -26,6 +26,9 @@ from training import training_loop
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
+import sys
+sys.path.append('./training/pixel2style2pixel')
+sys.path.append('./training/DECA')
 
 #----------------------------------------------------------------------------
 
@@ -163,7 +166,7 @@ def parse_comma_separated_list(s):
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 # @click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 type=bool, default=False, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
+@click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=0), default=1, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
 
 # @click.option('--sr_module',    help='Superresolution module', metavar='STR',  type=str, required=True)
@@ -192,7 +195,17 @@ def parse_comma_separated_list(s):
 @click.option('--density_reg_p_dist',    help='density regularization strength.', metavar='FLOAT', type=click.FloatRange(min=0), default=0.004, required=False, show_default=True)
 @click.option('--reg_type', help='Type of regularization', metavar='STR',  type=click.Choice(['l1', 'l1-alt', 'monotonic-detach', 'monotonic-fixed', 'total-variation']), required=False, default='l1')
 @click.option('--decoder_lr_mul',    help='decoder learning rate multiplier.', metavar='FLOAT', type=click.FloatRange(min=0), default=1, required=False, show_default=True)
+@click.option('--mode', help='autoencoder or eg3d', metavar='STR',  type=click.Choice(['AE', 'EG3D']), required=True, default='AE')
+@click.option('--pretrain', help='autoencoder or eg3d', metavar='STR',  type=str,  default=None)
+@click.option('--loss_selection', type=click.Choice(['vgg','l1','id', 'gan','deca']), multiple=True)
+@click.option('--block_selection', type=click.Choice(['4','8','16','32','64','128','256']), multiple=True)
+@click.option('--invert_map', type=bool, default=False)
+@click.option('--resolution_encode', help='encode resolution', metavar='INT',  type=int,  default=256)
+@click.option('--w_type', type=click.Choice(['w+', 'w++']), metavar='STR', default='w+')
 
+
+#XXX DEBUG LINE: python train.py --outdir=~/training-runs --cfg=ffhq --data=./inthewild_data --gpus=1 --batch 4 --gamma 1 --gen_pose_cond True --loss_selection l1 --workers 0 --pretrain /home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl
+#XXX DECA DEBUG LINE: python train.py --outdir=./training-runs_ae --cfg=ffhq --data=./inthewild_data --gpus=1 --batch 4 --gamma 1 --gen_pose_cond True --loss_selection l1 --workers 0 --block_selection 16 --block_selection 32 --pretrain /home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl --loss_selection l1 --loss_selection deca
 def main(**kwargs):
     """Train a GAN using the techniques described in the paper
     "Alias-Free Generative Adversarial Networks".
@@ -215,9 +228,12 @@ def main(**kwargs):
     python train.py --outdir=~/training-runs --cfg=stylegan2 --data=~/datasets/ffhq-1024x1024.zip \\
         --gpus=8 --batch=32 --gamma=10 --mirror=1 --aug=noaug
     """
+    
 
     # Initialize config.
     opts = dnnlib.EasyDict(kwargs) # Command line arguments.
+    if opts.invert_map:
+        assert opts.block_selection!=None
     c = dnnlib.EasyDict() # Main config dict.
     c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
     c.D_kwargs = dnnlib.EasyDict(class_name='training.networks_stylegan2.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
@@ -225,6 +241,13 @@ def main(**kwargs):
     c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
+    if opts.mode == 'AE':
+        c.mode = opts.mode
+        #breakpoint()
+        #c.block_selections = opts.block_selection
+        c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder', n_styles=14, img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
+        c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2AELoss')
 
     # Training set.
     c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
@@ -234,6 +257,13 @@ def main(**kwargs):
     c.training_set_kwargs.xflip = opts.mirror
 
     # Hyperparameters & settings.
+    ##
+    c.mode = opts.mode
+    c.pretrain = opts.pretrain
+    c.loss_selection = opts.loss_selection
+    c.invert_map = opts.invert_map
+    c.resolution_encode = opts.resolution_encode
+    ##
     c.num_gpus = opts.gpus
     c.batch_size = opts.batch
     c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
@@ -245,6 +275,7 @@ def main(**kwargs):
     c.loss_kwargs.r1_gamma = opts.gamma
     c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
     c.D_opt_kwargs.lr = opts.dlr
+    c.E_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
@@ -269,10 +300,12 @@ def main(**kwargs):
     c.G_kwargs.fused_modconv_default = 'inference_only' # Speed up training by using regular convolutions instead of grouped convolutions.
     c.loss_kwargs.filter_mode = 'antialiased' # Filter mode for raw images ['antialiased', 'none', float [0-1]]
     c.D_kwargs.disc_c_noise = opts.disc_c_noise # Regularization for discriminator pose conditioning
-
+    #breakpoint()
+    
     if c.training_set_kwargs.resolution == 512:
         sr_module = 'training.superresolution.SuperresolutionHybrid8XDC'
     elif c.training_set_kwargs.resolution == 256:
+        
         sr_module = 'training.superresolution.SuperresolutionHybrid4X'
     elif c.training_set_kwargs.resolution == 128:
         sr_module = 'training.superresolution.SuperresolutionHybrid2X'
@@ -308,6 +341,16 @@ def main(**kwargs):
             'avg_camera_radius': 2.7, # used only in the visualizer to specify camera orbit radius.
             'avg_camera_pivot': [0, 0, 0.2], # used only in the visualizer to control center of camera rotation.
         })
+    elif opts.cfg == 'celeba':
+        rendering_options.update({
+            'depth_resolution': 48, # number of uniform samples to take per ray.
+            'depth_resolution_importance': 48, # number of importance samples to take per ray.
+            'ray_start': 2.25, # near point along each ray to start taking samples.
+            'ray_end': 3.3, # far point along each ray to stop taking samples. 
+            'box_warp': 1, # the side-length of the bounding box spanned by the tri-planes; box_warp=1 means [-0.5, -0.5, -0.5] -> [0.5, 0.5, 0.5].
+            'avg_camera_radius': 2.7, # used only in the visualizer to specify camera orbit radius.
+            'avg_camera_pivot': [0, 0, 0.2], # used only in the visualizer to control center of camera rotation.
+        })    
     elif opts.cfg == 'afhq':
         rendering_options.update({
             'depth_resolution': 48,

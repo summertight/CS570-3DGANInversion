@@ -81,6 +81,7 @@ def download_file(session, file_spec, stats, chunk_size=128, num_attempts=10):
 
             # Validate.
             if 'file_size' in file_spec and data_size != file_spec['file_size']:
+                #import pdb;pdb.set_trace()
                 raise IOError('Incorrect file size', file_path)
             if 'file_md5' in file_spec and data_md5.hexdigest() != file_spec['file_md5']:
                 raise IOError('Incorrect file MD5', file_path)
