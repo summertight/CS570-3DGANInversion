@@ -200,12 +200,15 @@ def check_ddp_consistency(module, ignore_regex=None):
         fullname = type(module).__name__ + '.' + name
         if ignore_regex is not None and re.fullmatch(ignore_regex, fullname):
             continue
+        #if name == 'running_mean' or name == 'running_var':
+        #    continue
+        #print(fullname)
         tensor = tensor.detach()
         if tensor.is_floating_point():
             tensor = nan_to_num(tensor)
         other = tensor.clone()
         torch.distributed.broadcast(tensor=other, src=0)
-        assert (tensor == other).all(), fullname
+        assert (tensor == nan_to_num(other)).all(), fullname
 
 #----------------------------------------------------------------------------
 # Print summary table of module hierarchy.

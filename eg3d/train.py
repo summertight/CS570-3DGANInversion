@@ -107,9 +107,9 @@ def launch_training(c, desc, outdir, dry_run):
 
 #----------------------------------------------------------------------------
 
-def init_dataset_kwargs(data):
+def init_dataset_kwargs(data, mode):
     try:
-        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
+        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False, mode=mode)
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
         dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
         dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
@@ -195,7 +195,7 @@ def parse_comma_separated_list(s):
 @click.option('--density_reg_p_dist',    help='density regularization strength.', metavar='FLOAT', type=click.FloatRange(min=0), default=0.004, required=False, show_default=True)
 @click.option('--reg_type', help='Type of regularization', metavar='STR',  type=click.Choice(['l1', 'l1-alt', 'monotonic-detach', 'monotonic-fixed', 'total-variation']), required=False, default='l1')
 @click.option('--decoder_lr_mul',    help='decoder learning rate multiplier.', metavar='FLOAT', type=click.FloatRange(min=0), default=1, required=False, show_default=True)
-@click.option('--mode', help='autoencoder or eg3d', metavar='STR',  type=click.Choice(['AE', 'EG3D']), required=True, default='AE')
+@click.option('--mode', help='autoencoder or eg3d', metavar='STR',  type=click.Choice(['AE', 'EG3D', 'MFIM']), required=True, default='AE')
 @click.option('--pretrain', help='autoencoder or eg3d', metavar='STR',  type=str,  default=None)
 @click.option('--loss_selection', type=click.Choice(['vgg','l1','id', 'gan','deca']), multiple=True)
 @click.option('--block_selection', type=click.Choice(['4','8','16','32','64','128','256']), multiple=True)
@@ -206,6 +206,8 @@ def parse_comma_separated_list(s):
 
 #XXX DEBUG LINE: python train.py --outdir=~/training-runs --cfg=ffhq --data=./inthewild_data --gpus=1 --batch 4 --gamma 1 --gen_pose_cond True --loss_selection l1 --workers 0 --pretrain /home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl
 #XXX DECA DEBUG LINE: python train.py --outdir=./training-runs_ae --cfg=ffhq --data=./inthewild_data --gpus=1 --batch 4 --gamma 1 --gen_pose_cond True --loss_selection l1 --workers 0 --block_selection 16 --block_selection 32 --pretrain /home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl --loss_selection l1 --loss_selection deca
+#XXX MFIM no gan : python train.py --outdir=./training-runs-MFIM_nogan_11-16 --cfg=ffhq --data=/home/nas2_userG/junhahyung/FFHQ_png_512.zip  --gpus=2 --batch 16 --gamma 1 --gen_pose_cond True --loss_selection l1 --loss_selction vgg --loss_selection id --loss_selection deca --workers 4 --block_selection 16 --block_selection 32 --pretrain /home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl --invert_map True --w_type w++ --mode MFIM
+
 def main(**kwargs):
     """Train a GAN using the techniques described in the paper
     "Alias-Free Generative Adversarial Networks".
@@ -245,12 +247,23 @@ def main(**kwargs):
         c.mode = opts.mode
         #breakpoint()
         #c.block_selections = opts.block_selection
-        c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder', n_styles=14, img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
+        #c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder',\
+        c.E_kwargs = dnnlib.EasyDict(class_name='training.psp_encoders_cp.GradualStyleEncoder',\
+        
+                n_styles=14, img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
         c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
         c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2AELoss')
-
+    elif opts.mode == 'MFIM':
+        c.mode = opts.mode
+        #breakpoint()
+        #c.block_selections = opts.block_selection
+        #c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder',\
+        c.E_kwargs = dnnlib.EasyDict(class_name='training.psp_encoders_cp.GradualStyleEncoder',\
+                n_styles=14, img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
+        c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2SwapLoss')
     # Training set.
-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
+    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data, mode=opts.mode)
     if opts.cond and not c.training_set_kwargs.use_labels:
         raise click.ClickException('--cond=True requires labels specified in dataset.json')
     c.training_set_kwargs.use_labels = opts.cond

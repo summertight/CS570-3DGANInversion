@@ -67,10 +67,12 @@ class TriPlaneGenerator(torch.nn.Module):
         if use_cached_backbone and self._last_planes is not None:
             planes = self._last_planes
         else:
+            #breakpoint()
             planes = self.backbone.synthesis(ws, maps, update_emas=update_emas, **synthesis_kwargs)
+
         if cache_backbone:
             self._last_planes = planes
-
+        
         # Reshape output into three 32-channel planes
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
 

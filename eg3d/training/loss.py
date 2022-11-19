@@ -11,8 +11,8 @@
 """Loss functions."""
 
 import numpy as np
-import torch
-from torch_utils import training_stats
+import torch, gc
+from torch_utils import training_stats, misc
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
 from training.dual_discriminator import filtered_resizing
@@ -298,6 +298,280 @@ class StyleGAN2Loss(Loss):
                 (loss_Dreal + loss_Dr1).mean().mul(gain).backward()
 
 #----------------------------------------------------------------------------
+
+class StyleGAN2SwapLoss(Loss):
+    def __init__(self, device, rank, G, D, E, augment_pipe=None, blur_init_sigma=0, blur_fade_kimg=0, neural_rendering_resolution_initial=64, \
+    neural_rendering_resolution_final=None, neural_rendering_resolution_fade_kimg=0, filter_mode='antialiased', n_random_labels=None,\
+     loss_selection = None,  invert_map=False, resolution_encode = 512,\
+     r1_gamma_fade_kimg=0,pl_decay=0.01, r1_gamma=10,style_mixing_prob=0,pl_weight=0, pl_batch_shrink=2,pl_no_weight_grad=False,r1_gamma_init=0,\
+     gpc_reg_fade_kimg=1000, gpc_reg_prob=None, dual_discrimination=False, \
+     ):
+
+     
+        super().__init__()
+        self.device             = device
+        self.rank               = rank
+        self.G                  = G
+        self.D                  = D
+        self.E                  = E
+        self.augment_pipe       = augment_pipe
+        self.blur_init_sigma    = blur_init_sigma
+        self.blur_fade_kimg     = blur_fade_kimg
+        self.pl_mean            = torch.zeros([], device=device)
+        self.neural_rendering_resolution_initial = neural_rendering_resolution_initial
+        self.neural_rendering_resolution_final = neural_rendering_resolution_final
+        self.neural_rendering_resolution_fade_kimg = neural_rendering_resolution_fade_kimg
+        self.filter_mode        = filter_mode
+        self.resample_filter = upfirdn2d.setup_filter([1,3,3,1], device=device)
+   
+      
+        self.r1_gamma           = r1_gamma
+
+        self.loss_selection = loss_selection
+        
+
+
+        #XXX
+
+        self.style_mixing_prob  = style_mixing_prob
+        self.pl_weight          = pl_weight
+        self.pl_batch_shrink    = pl_batch_shrink
+        self.pl_decay           = pl_decay
+        self.pl_no_weight_grad  = pl_no_weight_grad
+
+        self.r1_gamma_init      = r1_gamma_init
+        self.r1_gamma_fade_kimg = r1_gamma_fade_kimg
+        self.gpc_reg_fade_kimg = gpc_reg_fade_kimg
+        self.gpc_reg_prob = gpc_reg_prob
+        self.dual_discrimination = dual_discrimination
+        self.blur_raw_target = True
+        #XXX
+
+        self.invert_map = invert_map
+        if 'vgg' in loss_selection:
+            self.criterion_VGG = VGGLoss().to(rank)
+        # TODO: Commit ID Loss
+        if 'id' in loss_selection:
+            self.criterion_ID  = IDLoss().to(rank)
+        if 'deca' in loss_selection:
+            self.criterion_DECA = DECA(config=deca_cfg, device=rank)
+            # self.face_cropper = FaceCropper()
+            self.FAN = batch_FAN(device='cuda')
+            self.cropper = Cropper(crop_size = 224)
+        #breakpoint()
+        self.resolution_encode = resolution_encode
+    
+    def run_SWAP(self, img_src, img_tgt, c, sync, neural_rendering_resolution, h_start=None):
+     
+        with misc.ddp_sync(self.E, sync):
+            ws, maps = self.E(img_src, img_tgt)
+            # XXX Hard coded latent selection. plz refer MFIM manuscript bitch.
+            # 인덱싱 ㅈㄴ 헷갈려
+            
+            ws_src = ws[:ws.shape[0]//2, 8:, ...]
+            ws_tgt = ws[ws.shape[0]//2:, :8, ...]
+
+            ws_mixed = torch.cat((ws_src, ws_tgt), axis=1) #XXX latent num-wise
+            maps_mixed = [map[ws.shape[0]//2:,...] if map is not None else None for map in maps]
+            #breakpoint()
+            # XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX
+            #breakpoint()
+            #torch.cuda.empty_cache()
+            #gc.collect()
+        with misc.ddp_sync(self.G, sync):
+            gen_output = self.G.synthesis(ws_mixed, maps_mixed, c, neural_rendering_resolution=neural_rendering_resolution)
+    
+       
+        return gen_output
+
+    
+
+    def run_D(self, img, c, blur_sigma=0):
+        blur_size = np.floor(blur_sigma * 3)
+        if blur_size > 0:
+            with torch.autograd.profiler.record_function('blur'):
+                f = torch.arange(-blur_size, blur_size + 1, device=img['image'].device).div(blur_sigma).square().neg().exp2()
+                img['image'] = upfirdn2d.filter2d(img['image'], f / f.sum())
+
+        if self.augment_pipe is not None:
+            augmented_pair = self.augment_pipe(torch.cat([img['image'],
+                                               torch.nn.functional.interpolate(img['image_raw'], size=img['image'].shape[2:], mode='bilinear', antialias=True)],
+                                               dim=1))
+            img['image'] = augmented_pair[:, :img['image'].shape[1]]
+            img['image_raw'] = torch.nn.functional.interpolate(augmented_pair[:, img['image'].shape[1]:], size=img['image_raw'].shape[2:], mode='bilinear', antialias=True)
+
+        logits = self.D(img, c)
+        return logits
+
+
+
+    def accumulate_gradients(self, phase, img_src, img_tgt, c, gain, sync, cur_nimg, snapshot_flag=False):
+        assert phase in ['Gmain', 'Dmain']
+        
+        blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
+
+        if self.neural_rendering_resolution_final is not None:
+            alpha = min(cur_nimg / (self.neural_rendering_resolution_fade_kimg * 1e3), 1)
+            neural_rendering_resolution = int(np.rint(self.neural_rendering_resolution_initial * (1 - alpha) + self.neural_rendering_resolution_final * alpha))
+        else:
+            neural_rendering_resolution = self.neural_rendering_resolution_initial
+
+        img_src_raw = filtered_resizing(img_src, size=neural_rendering_resolution, f=self.resample_filter, filter_mode=self.filter_mode)
+        img_tgt_raw = filtered_resizing(img_tgt, size=neural_rendering_resolution, f=self.resample_filter, filter_mode=self.filter_mode)
+        img_src_resized = filtered_resizing(img_src, size=self.resolution_encode, f=self.resample_filter, filter_mode=self.filter_mode)
+        img_tgt_resized = filtered_resizing(img_tgt, size=self.resolution_encode, f=self.resample_filter, filter_mode=self.filter_mode)
+        
+        real_img = {'image_src': img_src, 'image_src_raw': img_src_raw, 'image_src_resized': img_src_resized, 
+                'image_tgt': img_tgt, 'image_tgt_raw': img_tgt_raw, 'image_tgt_resized': img_tgt_resized}
+                
+        
+        # Gmain: L1 Loss and VGG Loss. / Maximize logits for generated images.
+        if phase in ['Gmain']:
+            with torch.autograd.profiler.record_function('Gmain_forward'):
+
+                gen_img = self.run_SWAP(real_img['image_src_resized'], real_img['image_tgt_resized'], c, sync=sync, neural_rendering_resolution=neural_rendering_resolution)
+                #gen_img = self.run_EG(real_img['image_src'], c, neural_rendering_resolution=neural_rendering_resolution)
+
+                # L1 Loss
+                loss_Gmain = 0.0
+                
+                if 'l1' in self.loss_selection:
+          
+                    #import pdb;pdb.set_trace()
+                    loss_l2 = torch.nn.functional.l1_loss(gen_img['image'], real_img['image_tgt'])
+                    loss_l2_raw = torch.nn.functional.l1_loss(gen_img['image_raw'], real_img['image_tgt_raw'])
+
+                    loss_Gmain += (loss_l2_raw + loss_l2)
+                    training_stats.report('Loss/LIA3D/loss_L1', loss_l2)
+                    training_stats.report('Loss/LIA3D/loss_L1_raw', loss_l2_raw)
+                
+                # Perceptual Loss
+                if 'vgg' in self.loss_selection:
+                
+                    #breakpoint()
+                    loss_vgg = self.criterion_VGG(gen_img['image'], real_img['image_tgt']).mean()
+                    #loss_vgg_raw = self.criterion_VGG(gen_img['image_raw'], real_img['image_src_raw']).mean()
+                    #loss_Gmain += (loss_vgg_raw + loss_vgg)
+                    loss_Gmain += loss_vgg
+                    training_stats.report('Loss/LIA3D/loss_VGG', loss_vgg)
+                    #training_stats.report('Loss/LIA3D/loss_VGG_raw', loss_vgg_raw)
+                
+                # TODO: Commit ID Loss
+                if 'id' in self.loss_selection:
+                    
+                    loss_id = self.criterion_ID(gen_img['image'], real_img['image_src']).mean()
+                    loss_Gmain += loss_id
+                    training_stats.report('Loss/LIA3D/loss_ID', loss_id)
+                
+                if 'deca' in self.loss_selection:
+                    try:
+                        ldmks_gen = self.FAN.run((gen_img['image']+1)*127.5)#XXX (0,255)
+                    
+
+
+                    
+                        image_cropped_gen, _ = self.cropper.crop(image = gen_img['image'],points = torch.tensor(ldmks_gen))
+                    
+                        codedict_gen = self.criterion_DECA.encode((image_cropped_gen + 1)/2)#XXX (0,1)
+
+                        ldmks_src = self.FAN.run((real_img['image_src']+1)*127.5)#XXX (0,255)
+                        image_cropped_src, _ = self.cropper.crop(image = real_img['image_src'],points = torch.tensor(ldmks_src))
+                        codedict_src = self.criterion_DECA.encode((image_cropped_src + 1)/2)#XXX (0,1)
+                        #import pdb;pdb.set_trace()
+                        ldmks_tgt = self.FAN.run((real_img['image_tgt']+1)*127.5)#XXX (0,255)
+                        image_cropped_tgt, _ = self.cropper.crop(image = real_img['image_tgt'],points = torch.tensor(ldmks_tgt))
+                        codedict_tgt = self.criterion_DECA.encode((image_cropped_tgt + 1)/2)#XXX (0,1)
+
+                        loss_3dmm_shape = torch.nn.functional.mse_loss(codedict_gen['shape'], codedict_src['shape'])
+                        loss_3dmm_exp = torch.nn.functional.mse_loss(codedict_gen['exp'], codedict_tgt['exp'])
+                        loss_Gmain += (loss_3dmm_shape + loss_3dmm_exp)
+                        training_stats.report('Loss/LIA3D/loss_3dmm_shape', loss_3dmm_shape)
+                        training_stats.report('Loss/LIA3D/loss_3dmm_exp', loss_3dmm_exp)
+                    except:
+                        #print()
+                        #print('Not face yet;; -> NO 3DMM LOSS RN!')
+                        pass
+                        
+                    
+                if 'gan' in self.loss_selection:
+                
+                        
+                    gen_logits = self.run_D(gen_img, c, blur_sigma=blur_sigma)
+                    loss_gan = torch.nn.functional.softplus(-gen_logits)
+                    loss_Gmain += loss_gan.mean()
+                    training_stats.report('Loss/LIA3D/loss_ganG', loss_gan.mean())
+     
+                
+            with torch.autograd.profiler.record_function('Gmain_backward'):
+                loss_Gmain.mean().mul(gain).backward()
+        
+
+
+        # Dmain: Minimize logits for generated images.
+        if 'gan' in self.loss_selection:
+            loss_Dgen = 0
+            if phase in ['Dmain']:
+                with torch.autograd.profiler.record_function('Dgen_forward'):
+                    if self.encoder_type=='self_cross':
+                        gen_img = self.run_G_double(real_img['image_src'], real_img['image_drv'], c, neural_rendering_resolution=neural_rendering_resolution)
+                        gen_logits = self.run_D_double(gen_img, c, blur_sigma=blur_sigma)
+
+                        training_stats.report('Loss/scores/fake_self', gen_logits[0])
+                        training_stats.report('Loss/signs/fake_self', gen_logits[0].sign())
+                        training_stats.report('Loss/scores/fake_cross', gen_logits[1])
+                        training_stats.report('Loss/signs/fake_cross', gen_logits[1].sign())
+                        loss_Dgen_self = torch.nn.functional.softplus(gen_logits[0])
+                        loss_Dgen_cross = torch.nn.functional.softplus(gen_logits[1])
+                        loss_Dgen = loss_Dgen_self+loss_Dgen_cross
+
+                    else:
+                            
+                        gen_img = self.run_G(real_img['image_src'], real_img['image_drv'], c, neural_rendering_resolution=neural_rendering_resolution)
+                        gen_logits = self.run_D(gen_img, c, blur_sigma=blur_sigma)
+
+                        training_stats.report('Loss/scores/fake', gen_logits)
+                        training_stats.report('Loss/signs/fake', gen_logits.sign())
+                        
+                        loss_Dgen = torch.nn.functional.softplus(gen_logits)
+                
+                with torch.autograd.profiler.record_function('Dgen_backward'):
+                    
+                    loss_Dgen.mean().mul(gain).backward()
+            # Dmain: Maximize logits for real images.
+            if phase in ['Dmain']:
+                with torch.autograd.profiler.record_function('Dreal_forward'):
+                    real_img_tmp_image_self = real_img['image_drv'].detach().requires_grad_(False)
+                    real_img_tmp_image_raw_self = real_img['image_drv_raw'].detach().requires_grad_(False)
+                    real_img_tmp_image_cross = real_img['image_drv'].detach().requires_grad_(False)
+                    real_img_tmp_image_raw_cross = real_img['image_drv_raw'].detach().requires_grad_(False)
+                    real_img_tmp = {'image': real_img_tmp_image_self, 'image_raw': real_img_tmp_image_raw_self, 'image_cross':real_img_tmp_image_cross,'image_raw_cross':real_img_tmp_image_raw_cross}
+
+                    real_logits = self.run_D_double(real_img_tmp, c, blur_sigma=blur_sigma)
+                    
+                    loss_Dreal = 0
+                    #loss_Dreal = torch.nn.functional.softplus(-real_logits)
+
+                    loss_Dreal_self = torch.nn.functional.softplus(-real_logits[0])
+                    loss_Dreal_cross = torch.nn.functional.softplus(-real_logits[1])
+                    loss_Dreal = loss_Dreal_self+loss_Dreal_cross
+                    
+                    training_stats.report('Loss/scores/real_self', real_logits[0])
+                    training_stats.report('Loss/signs/real_self', real_logits[0].sign())
+                    training_stats.report('Loss/scores/real_fake', real_logits[1])
+                    training_stats.report('Loss/signs/real_fake', real_logits[1].sign())
+                 
+                    if self.encoder_type =='self_cross':
+                        training_stats.report('Loss/LIA3D/loss_ganD', loss_Dgen_self.mean() +loss_Dgen_cross.mean() + loss_Dreal.mean())
+
+                    else:
+                        training_stats.report('Loss/LIA3D/loss_ganD', loss_Dgen + loss_Dreal)
+
+                with torch.autograd.profiler.record_function('Dreal_backward'):
+                    (loss_Dreal).mean().mul(gain).backward()
+        if snapshot_flag:
+            return real_img, gen_img
+        
+
 class StyleGAN2AELoss(Loss):
     def __init__(self, device, rank, G, D, E, augment_pipe=None, blur_init_sigma=0, blur_fade_kimg=0, neural_rendering_resolution_initial=64, \
     neural_rendering_resolution_final=None, neural_rendering_resolution_fade_kimg=0, filter_mode='antialiased', n_random_labels=None,\
@@ -386,7 +660,8 @@ class StyleGAN2AELoss(Loss):
 
             
             ws, maps = self.E.encode(img_src_resized)
-
+            torch.cuda.empty_cache()
+            gc.collect()
             #breakpoint()
             
             gen_output = self.G.synthesis(ws, maps, c, neural_rendering_resolution=neural_rendering_resolution)

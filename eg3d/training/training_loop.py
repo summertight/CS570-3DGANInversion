@@ -18,7 +18,7 @@ import pickle
 import psutil
 import PIL.Image
 import numpy as np
-import torch
+import torch, gc
 import dnnlib
 from torch_utils import misc
 from torch_utils import training_stats
@@ -31,7 +31,45 @@ from camera_utils import LookAtPoseSampler
 from training.crosssection_utils import sample_cross_section
 
 #----------------------------------------------------------------------------
+import torch
 
+class BatchNormXd(torch.nn.modules.batchnorm._BatchNorm):
+    def _check_input_dim(self, input):
+        # The only difference between BatchNorm1d, BatchNorm2d, BatchNorm3d, etc
+        # is this method that is overwritten by the sub-class
+        # This original goal of this method was for tensor sanity checks
+        # If you're ok bypassing those sanity checks (eg. if you trust your inference
+        # to provide the right dimensional inputs), then you can just use this method
+        # for easy conversion from SyncBatchNorm
+        # (unfortunately, SyncBatchNorm does not store the original class - if it did
+        #  we could return the one that was originally created)
+        return
+
+    
+def revert_sync_batchnorm(module):
+    # this is very similar to the function that it is trying to revert:
+    # https://github.com/pytorch/pytorch/blob/c8b3686a3e4ba63dc59e5dcfe5db3430df256833/torch/nn/modules/batchnorm.py#L679
+    module_output = module
+    if isinstance(module, torch.nn.modules.batchnorm.SyncBatchNorm):
+        new_cls = BatchNormXd
+        module_output = BatchNormXd(module.num_features,
+                                               module.eps, module.momentum,
+                                               module.affine,
+                                               module.track_running_stats)
+        if module.affine:
+            with torch.no_grad():
+                module_output.weight = module.weight
+                module_output.bias = module.bias
+        module_output.running_mean = module.running_mean
+        module_output.running_var = module.running_var
+        module_output.num_batches_tracked = module.num_batches_tracked
+        if hasattr(module, "qconfig"):
+            module_output.qconfig = module.qconfig
+    for name, child in module.named_children():
+        module_output.add_module(name, revert_sync_batchnorm(child))
+    del module
+    return module_output
+#----------------------------------------------------------------------------
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
     gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
@@ -135,17 +173,35 @@ def training_loop(
 
 ):
     # Initialize.
+    '''
+    start_time = time.time()
+    device = torch.device('cuda', rank)
+    np.random.seed(random_seed * num_gpus + rank)
+    torch.cuda.set_device(rank)
+    torch.cuda.empty_cache()
+    torch.manual_seed(random_seed * num_gpus + rank)
+    torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
+    torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
+    torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
+    #torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False  # Improves numerical accuracy.
+    conv2d_gradfix.enabled = True                       # Improves training speed. # TODO: ENABLE
+    grid_sample_gradfix.enabled = False                  # Avoids errors with the augmentation pipe.
+    '''
     start_time = time.time()
     device = torch.device('cuda', rank)
     np.random.seed(random_seed * num_gpus + rank)
     torch.manual_seed(random_seed * num_gpus + rank)
     torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
-    torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
-    torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False  # Improves numerical accuracy.
-    conv2d_gradfix.enabled = True                       # Improves training speed. # TODO: ENABLE
-    grid_sample_gradfix.enabled = False                  # Avoids errors with the augmentation pipe.
-
+    torch.backends.cuda.matmul.allow_tf32 = False  # Allow PyTorch to internally use tf32 for matmul
+    torch.backends.cudnn.allow_tf32 = False       # Allow PyTorch to internally use tf32 for convolutions
+    conv2d_gradfix.enabled = True                       # Improves training speed.
+    grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
+    #XXX
+    __CUR_NIMG__ = torch.tensor(0, dtype=torch.long, device=device)
+    __CUR_TICK__ = torch.tensor(0, dtype=torch.long, device=device)
+    __BATCH_IDX__ = torch.tensor(0, dtype=torch.long, device=device)
+    best_fid = 9999
+    #XXX
     # Load training set.
     if rank == 0:
         print('Loading training set...')
@@ -167,8 +223,22 @@ def training_loop(
     G.register_buffer('dataset_label_std', torch.tensor(training_set.get_label_std()).to(device))
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
-    if mode == 'AE':
+    if mode == 'AE' or mode == 'MFIM':
+        #breakpoint()
+        #from training.psp_encoders_cp import GradualStyleEncoder as GSE
+        #E = GSE.train().requires_grad_(False).to(device)
         E = dnnlib.util.construct_class_by_name(**E_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
+        #E = torch.nn.SyncBatchNorm.convert_sync_batchnorm(E, torch.distributed.new_group(list(range(num_gpus))))
+        E = torch.nn.SyncBatchNorm.convert_sync_batchnorm(E).to(device)
+        #E = torch.nn.parallel.DistributedDataParallel(
+        #        E,
+        #        device_ids=[device],
+        #        output_device=device,
+        #    )
+        # E.requires_grad_(True)
+        # E = torch.nn.parallel.DistributedDataParallel(E, device_ids=[rank], output_device=rank)
+       # E = torch.nn.SyncBatchNorm.convert_sync_batchnorm(E, 0)
+       
     # Load pretrained smthng for finetuning or inversion
     if (pretrain is not None) and (rank == 0):
         print(f'Load pre-trained weight from "{pretrain}"')
@@ -189,15 +259,22 @@ def training_loop(
             resume_data = legacy.load_network_pkl(f)
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+        #XXX
+        __CUR_NIMG__ = resume_data['progress']['cur_nimg'].to(device)
+        __CUR_TICK__ = resume_data['progress']['cur_tick'].to(device)
+        __BATCH_IDX__ = resume_data['progress']['batch_idx'].to(device)
+        best_fid = resume_data['progress']['best_fid']  # only needed for rank == 0
+        #XXX
 
     # Print network summary tables.
+    '''
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
         c = torch.empty([batch_gpu, G.c_dim], device=device)
         #import pdb;pdb.set_trace()
         img = misc.print_module_summary(G, [z, c])
         misc.print_module_summary(D, [img, c])
-
+    '''
     # Setup augmentation.
     if rank == 0:
         print('Setting up augmentation...')
@@ -208,25 +285,52 @@ def training_loop(
         augment_pipe.p.copy_(torch.as_tensor(augment_p))
         if ada_target is not None:
             ada_stats = training_stats.Collector(regex='Loss/signs/real')
-
+    
+    #XXX old version
+    '''
     # Distribute across GPUs.
     if mode == 'EG3D':
         module_list = [G, D, G_ema, augment_pipe]
-    elif mode == 'AE':
+    elif mode == 'AE' or mode == 'MFIM':
         module_list = [E, G, D, G_ema, augment_pipe]
+        #module_list = [G, D]
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
     #for module in [G, D, G_ema, augment_pipe]:
+    
     for module in module_list:
         if module is not None:
             for param in misc.params_and_buffers(module):
                 if param.numel() > 0 and num_gpus > 1:
+                    #gc.collect()
+                    #torch.cuda.empty_cache()
                     torch.distributed.broadcast(param, src=0)
+    '''
+    
+    
+    if mode == 'EG3D':
+        module_list = [G, D, G_ema, augment_pipe]
+    elif mode == 'AE' or mode == 'MFIM':
+        module_list = [('E',E), ('G',G), ('D',D)]
+    if rank == 0:
+        print(f'Distributing across {num_gpus} GPUs...')
+    #for name, module in [('G_mapping', G.mapping), ('G_synthesis', G.synthesis), ('D', D), (None, G_ema), ('Diffusion', diffusion)]:
+    ddp_modules = dict() #XXX
+    for name, module in module_list:
+        if (num_gpus > 1) and (module is not None) and len(list(module.parameters())) != 0:
+            module.requires_grad_(True)
+            module = torch.nn.parallel.DistributedDataParallel(module, device_ids=[device], broadcast_buffers=False)
+            module.requires_grad_(False)
+        if name is not None: #XXX
+            ddp_modules[name] = module #XXX
+    
+    #torch.cuda.set_device(rank)
+    
 
     # Setup training phases.
     if rank == 0:
         print('Setting up training phases...')
-    if mode == 'AE':
+    if mode == 'AE' or mode == 'MFIM':
         loss = dnnlib.util.construct_class_by_name(device=device, rank=rank, G=G, D=D, E=E, augment_pipe=augment_pipe,\
             loss_selection = loss_selection, invert_map = invert_map, resolution_encode=resolution_encode, **loss_kwargs) # subclass of training.loss.Loss
     else:
@@ -243,6 +347,16 @@ def training_loop(
             params += list(G.parameters())
         opt = dnnlib.util.construct_class_by_name(params=params, **E_opt_kwargs) # subclass of torch.optim.Optimizer
         phases += [dnnlib.EasyDict(name='Gmain', module=E, opt=opt, interval=1)]
+
+    elif mode == 'MFIM':
+        params = []
+        params += list(E.parameters())
+        params += list(G.parameters())
+        opt = dnnlib.util.construct_class_by_name(params=params, **E_opt_kwargs) # subclass of torch.optim.Optimizer
+        phases += [dnnlib.EasyDict(name='Gmain', module=[E,G], opt=opt, interval=1)]
+        if 'gan' in loss_selection:
+            opt = dnnlib.util.construct_class_by_name(params=params, **D_opt_kwargs)
+            phases += [dnnlib.EasyDict(name='Dmain', module=D, opt=opt, interval=1)]
 
     else:
         for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
@@ -265,15 +379,15 @@ def training_loop(
             phase.end_event = torch.cuda.Event(enable_timing=True)
 
     # Export sample images.
-    grid_size = None
-    grid_z = None
-    grid_c = None
-    if rank == 0:
-        print('Exporting sample images...')
-        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
-        save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
-        grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
-        grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
+    #grid_size = None
+    #grid_z = None
+    #grid_c = None
+    # TODO: Export sample images.
+    # if rank == 0:
+    #     print('Exporting sample images...')
+    #     grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+    #     save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
+
 
     # Initialize logs.
     if rank == 0:
@@ -294,14 +408,31 @@ def training_loop(
     if rank == 0:
         print(f'Training for {total_kimg} kimg...')
         print()
+    if num_gpus > 1:  # broadcast loaded states to all
+        torch.distributed.broadcast(__CUR_NIMG__, 0)
+        torch.distributed.broadcast(__CUR_TICK__, 0)
+        torch.distributed.broadcast(__BATCH_IDX__, 0)
+        torch.distributed.barrier()
+    '''
     cur_nimg = resume_kimg * 1000
     cur_tick = 0
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
     batch_idx = 0
+    '''
+    #XXX
+    cur_nimg = __CUR_NIMG__.item()
+    cur_tick = __CUR_TICK__.item()
+    tick_start_nimg = cur_nimg
+    tick_start_time = time.time()
+    maintenance_time = tick_start_time - start_time
+    batch_idx = __BATCH_IDX__.item()
+    #XXX
+
     if progress_fn is not None:
-        progress_fn(0, total_kimg)
+        #progress_fn(0, total_kimg)
+        progress_fn(cur_nimg // 1000, total_kimg)
     while True:
 
         # Fetch training data.
@@ -310,6 +441,13 @@ def training_loop(
                 phase_real_img, phase_real_c = next(training_set_iterator)
                 phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
                 phase_real_c = phase_real_c.to(device).split(batch_gpu)
+
+            elif mode == 'MFIM':
+                phase_real_img_src, phase_real_img_tgt, phase_real_c_tgt = next(training_set_iterator)
+                phase_real_img_src = (phase_real_img_src.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+                phase_real_img_tgt = (phase_real_img_tgt.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+                phase_real_c_tgt = phase_real_c_tgt.to(device).split(batch_gpu)
+
             else:
                 phase_real_img, phase_real_c = next(training_set_iterator)
                 phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
@@ -325,12 +463,13 @@ def training_loop(
             for phase in phases:
                 if batch_idx % phase.interval != 0:
                     continue
+
+                # Initialize gradient accumulation.
                 if phase.start_event is not None:
                     phase.start_event.record(torch.cuda.current_stream(device))
-
-                # Accumulate gradients.
                 phase.opt.zero_grad(set_to_none=True)
                 phase.module.requires_grad_(True)
+
                 for real_img, real_c in zip(phase_real_img, phase_real_c):
                     loss.accumulate_gradients(phase=phase.name, img_src=real_img, c=real_c, gain=phase.interval, cur_nimg=cur_nimg)
                 phase.module.requires_grad_(False)
@@ -379,6 +518,8 @@ def training_loop(
             # Perform maintenance tasks once per tick.
             done = (cur_nimg >= total_kimg * 1000)
             if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
+                if rank==0:
+                    print(cur_nimg, ":now")
                 continue
 
             # Print status line, accumulating the same information in training_stats.
@@ -481,6 +622,203 @@ def training_loop(
                 if rank == 0:
                     with open(snapshot_pkl, 'wb') as f:
                         pickle.dump(snapshot_data, f)
+                    print(f'Pickle dump has done @{cur_tick}')
+
+            # Evaluate metrics.
+            '''
+            if (snapshot_data is not None) and (len(metrics) > 0):
+                if rank == 0:
+                    print(run_dir)
+                    print('Evaluating metrics...')
+                for metric in metrics:
+                    result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
+                        dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
+                    if rank == 0:
+                        metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
+                    stats_metrics.update(result_dict.results)
+            del snapshot_data # conserve memory
+            '''
+            # Collect statistics.
+            for phase in phases:
+                value = []
+                if (phase.start_event is not None) and (phase.end_event is not None):
+                    phase.end_event.synchronize()
+                    value = phase.start_event.elapsed_time(phase.end_event)
+                training_stats.report0('Timing/' + phase.name, value)
+            stats_collector.update()
+            stats_dict = stats_collector.as_dict()
+
+            # Update logs.
+            timestamp = time.time()
+            if stats_jsonl is not None:
+                fields = dict(stats_dict, timestamp=timestamp)
+                stats_jsonl.write(json.dumps(fields) + '\n')
+                stats_jsonl.flush()
+            if stats_tfevents is not None:
+                global_step = int(cur_nimg / 1e3)
+                walltime = timestamp - start_time
+                for name, value in stats_dict.items():
+                    stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
+                for name, value in stats_metrics.items():
+                    stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
+                stats_tfevents.flush()
+            if progress_fn is not None:
+                progress_fn(cur_nimg // 1000, total_kimg)
+
+            # Update state.
+            cur_tick += 1
+            tick_start_nimg = cur_nimg
+            tick_start_time = time.time()
+            maintenance_time = tick_start_time - tick_end_time
+            if done:
+                break
+
+
+        elif mode == 'MFIM':
+            for phase in phases:
+                if batch_idx % phase.interval != 0:
+                    continue
+                if phase.start_event is not None:
+                    phase.start_event.record(torch.cuda.current_stream(device))
+
+                # Accumulate gradients.
+                phase.opt.zero_grad(set_to_none=True)
+
+                for module in phase.module:
+                    module.requires_grad_(True) 
+               
+                for round_idx, (real_img_src, real_img_tgt, real_c_tgt) in enumerate(zip(phase_real_img_src, phase_real_img_tgt, phase_real_c_tgt)):
+                    sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
+                    snapshot_flag = False
+                    if (rank == 0) and (image_snapshot_ticks is not None) and (cur_tick % image_snapshot_ticks == 0):
+                        snapshot_flag = True
+                        real_img, gen_img = loss.accumulate_gradients(phase=phase.name, img_src=real_img_src, img_tgt=real_img_tgt, c=real_c_tgt, gain=phase.interval, sync=sync, cur_nimg=cur_nimg, snapshot_flag = snapshot_flag)
+                    else:
+                        loss.accumulate_gradients(phase=phase.name, img_src=real_img_src, img_tgt=real_img_tgt, c=real_c_tgt, gain=phase.interval, sync=sync, cur_nimg=cur_nimg, snapshot_flag = snapshot_flag)
+     
+                for module in phase.module:
+                    module.requires_grad_(False) 
+ 
+
+                # Update weights.
+                with torch.autograd.profiler.record_function(phase.name + '_opt'):
+                    params = [param for param in E.parameters() if param.numel() > 0 and param.grad is not None]
+                    params += [param for param in G.parameters() if param.numel() > 0 and param.grad is not None]
+                    if len(params) > 0:
+                        flat = torch.cat([param.grad.flatten() for param in params])
+                        if num_gpus > 1:
+                            torch.distributed.all_reduce(flat)
+                            flat /= num_gpus
+                        misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
+                        grads = flat.split([param.numel() for param in params])
+                        for param, grad in zip(params, grads):
+                            param.grad = grad.reshape(param.shape)
+                    phase.opt.step()
+                if phase.end_event is not None:
+                    phase.end_event.record(torch.cuda.current_stream(device))
+
+            # Update G_ema.
+            with torch.autograd.profiler.record_function('Gema'):
+                ema_nimg = ema_kimg * 1000
+                if ema_rampup is not None:
+                    ema_nimg = min(ema_nimg, cur_nimg * ema_rampup)
+                ema_beta = 0.5 ** (batch_size / max(ema_nimg, 1e-8))
+                for p_ema, p in zip(G_ema.parameters(), G.parameters()):
+                    p_ema.copy_(p.lerp(p_ema, ema_beta))
+                for b_ema, b in zip(G_ema.buffers(), G.buffers()):
+                    b_ema.copy_(b)
+                G_ema.neural_rendering_resolution = G.neural_rendering_resolution
+                G_ema.rendering_kwargs = G.rendering_kwargs.copy()
+
+            # Update state.
+            cur_nimg += batch_size
+            batch_idx += 1
+
+            # Execute ADA heuristic.
+            if (ada_stats is not None) and (batch_idx % ada_interval == 0):
+                ada_stats.update()
+                adjust = np.sign(ada_stats['Loss/signs/real'] - ada_target) * (batch_size * ada_interval) / (ada_kimg * 1000)
+                augment_pipe.p.copy_((augment_pipe.p + adjust).max(misc.constant(0, device=device)))
+
+            # Perform maintenance tasks once per tick.
+            done = (cur_nimg >= total_kimg * 1000)
+            if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
+                if rank==0:
+                    print(cur_nimg, ":now")
+                continue
+
+            # Print status line, accumulating the same information in training_stats.
+            tick_end_time = time.time()
+            fields = []
+            fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
+            fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<8.1f}"]
+            fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
+            fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
+            fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
+            fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
+            fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
+            fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
+            fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
+            torch.cuda.reset_peak_memory_stats()
+            fields += [f"augment {training_stats.report0('Progress/augment', float(augment_pipe.p.cpu()) if augment_pipe is not None else 0):.3f}"]
+            training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / (60 * 60))
+            training_stats.report0('Timing/total_days', (tick_end_time - start_time) / (24 * 60 * 60))
+            if rank == 0:
+                print(' '.join(fields))
+
+            # Check for abort.
+            if (not done) and (abort_fn is not None) and abort_fn():
+                done = True
+                if rank == 0:
+                    print()
+                    print('Aborting...')
+
+            # Save image snapshot.
+            if (rank == 0) and (image_snapshot_ticks is not None) and (cur_tick % image_snapshot_ticks == 0):
+                if mode == 'MFIM':
+                    
+                    #out = loss.run_SWAP_straight(real_img_src, real_img_tgt, real_c_tgt, loss_kwargs.neural_rendering_resolution_initial)
+                    
+                    
+                    images = torch.cat((real_img['image_src'], real_img['image_tgt'], gen_img['image'].detach()), 0).cpu().numpy()
+                    #images = torch.cat([o['image'].cpu() for o in out]).numpy()
+                    images_depth = gen_img['image_depth'].detach().cpu().numpy()
+                    #breakpoint()
+                    save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=(int(batch_size/num_gpus),3))
+                    save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth.png'), drange=[images_depth.min(), images_depth.max()], grid_size=(int(batch_size/num_gpus),1))
+                    
+                    
+               
+        
+            # Save network snapshot.
+            snapshot_pkl = None
+            snapshot_data = None
+            if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+                snapshot_data = dict(training_set_kwargs=dict(training_set_kwargs))
+                if mode == 'MFIM':
+                    check_modules = [('G', G), ('G_ema', G_ema), ('E', E), ('D',D)]
+
+                for name, module in check_modules:
+                    if module is not None:
+                        if num_gpus > 1:
+                            #pass
+                            misc.check_ddp_consistency(module, ignore_regex=r'.*\.[^.]+_(avg|ema)')
+                        if name == 'E':
+                            module = copy.deepcopy(revert_sync_batchnorm(module)).eval().requires_grad_(False).cpu()
+                        else:
+                            module = copy.deepcopy(module).eval().requires_grad_(False).cpu()
+                    snapshot_data[name] = module
+                    del module # conserve memory
+                snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
+                if rank == 0:
+                    with open(snapshot_pkl, 'wb') as f:
+                        pickle.dump(snapshot_data, f)
+                    print("***"*10)
+                    print("***"*10)
+                    print('Pickle dumped!')
+                    print("***"*10)
+                    print("***"*10)
+                
 
             # Evaluate metrics.
             '''

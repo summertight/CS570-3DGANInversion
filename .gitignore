@@ -43,3 +43,4 @@ eg3d/ffhq-dataset-v2.json
 eg3d/dataset_dict.json
 dataset_preprocessing/ffhq/Deep3DFaceRecon_pytorch
 dataset_preprocessing/ffhq/
+dataset_preprocessing/ffhq/Deep3DFaceRecon_pytorch
