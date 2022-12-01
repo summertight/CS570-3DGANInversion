@@ -227,10 +227,16 @@ def training_loop(
         print(f'Resuming from "{resume_pkl}"')
         ep ='/home/nas4_user/jaeseonglee/ICCV2023/eg3d/eg3d/training-runs-ae_new_128_w+_1129/00010-ffhq-FFHQ_png_512-gpus2-batch8-gamma1/E-snapshot-000000.pth'
         gp ='/home/nas4_user/jaeseonglee/ICCV2023/eg3d/eg3d/training-runs-ae_new_128_w+_1129/00010-ffhq-FFHQ_png_512-gpus2-batch8-gamma1/G-snapshot-000000.pth'
+        dp =None
+
         E_ckpt = torch.load(ep)
         G_ckpt = torch.load(gp)
+        D_ckpt = torch.load(dp)
+
         E.load_state_dict(E_ckpt)
         G.load_state_dict(G_ckpt)
+        D.load_state_dict(D_ckpt)
+
         '''
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = legacy.load_network_pkl(f)
@@ -261,6 +267,8 @@ def training_loop(
         module_list = [G, D, G_ema, augment_pipe]
     elif mode == 'AE' or mode == 'AE_new' or mode=='AE_Platon':
         module_list = [E, G]
+        if 'gan' in loss_selection:
+            module_list.append(D)
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
     #for module in [G, D, G_ema, augment_pipe]:
@@ -290,7 +298,7 @@ def training_loop(
         opt = dnnlib.util.construct_class_by_name(params=params, **E_opt_kwargs) # subclass of torch.optim.Optimizer
         phases += [dnnlib.EasyDict(name='Gmain', module=[E,G], opt=opt, interval=1)]
 
-    elif mode == 'AE_new' or mode=='AE_Platon':
+    elif mode == 'AE_new':
         #import pdb;pdb.set_trace()
         params = []
         params += list(E.parameters())
@@ -298,6 +306,24 @@ def training_loop(
         
         opt = dnnlib.util.construct_class_by_name(params=params, **E_opt_kwargs) # subclass of torch.optim.Optimizer
         phases += [dnnlib.EasyDict(name='Gmain', module=[E,G], opt=opt, interval=1)]
+
+    elif mode=='AE_Platon':
+        #import pdb;pdb.set_trace()
+        params = []
+        params += list(E.parameters())
+        params += list(G.backbone.parameters())
+        
+        opt = dnnlib.util.construct_class_by_name(params=params, **E_opt_kwargs) # subclass of torch.optim.Optimizer
+        phases += [dnnlib.EasyDict(name='Gmain', module=[E,G], opt=opt, interval=1)]
+
+        if 'gan' in loss_selection:
+            mb_ratio = reg_interval / (reg_interval + 1)
+            opt_kwargs = dnnlib.EasyDict(opt_kwargs)
+            opt_kwargs.lr = opt_kwargs.lr * mb_ratio
+            opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
+            opt = dnnlib.util.construct_class_by_name(D.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            phases += [dnnlib.EasyDict(name=name+'main', module=[D], opt=opt, interval=1)]
+            phases += [dnnlib.EasyDict(name=name+'reg', module=[D], opt=opt, interval=reg_interval)]
 
     else:
         for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
@@ -364,10 +390,12 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
+
             if mode == 'AE' or mode=='AE_new' or mode=='AE_Platon':
                 phase_real_img, phase_real_c = next(training_set_iterator)
                 phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
                 phase_real_c = phase_real_c.to(device).split(batch_gpu)
+
             else:
                 phase_real_img, phase_real_c = next(training_set_iterator)
                 phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
@@ -380,9 +408,12 @@ def training_loop(
 
         # Execute training phases.
         if mode == 'AE'or mode=='AE_new' or mode=='AE_Platon':
+
             for phase in phases:
+
                 if batch_idx % phase.interval != 0:
                     continue
+
                 if phase.start_event is not None:
                     phase.start_event.record(torch.cuda.current_stream(device))
 
@@ -479,13 +510,21 @@ def training_loop(
             # Save image snapshot.
             if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
                 
+                if mode == 'AE_Platon':
+
+                    images = torch.cat((real_img_save['image_src'], gen_img_save['src']['image'].detach(), gen_img_save['roll']['image'].detach()), 0).cpu().numpy()
+                    images_depth = torch.cat((gen_img_save['src']['image_depth'].detach(),gen_img_save['roll']['image_depth'].detach()),0).cpu().numpy()
+
+                    save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=(int(batch_size/num_gpus),3))
+                    save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth.png'), drange=[images_depth.min(), images_depth.max()], grid_size=(int(batch_size/num_gpus),2))
                
-                images = torch.cat((real_img_save['image_src'], gen_img_save['image'].detach()), 0).cpu().numpy()
-                #images = torch.cat([o['image'].cpu() for o in out]).numpy()
-                images_depth = gen_img_save['image_depth'].detach().cpu().numpy()
-                #breakpoint()
-                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=(int(batch_size/num_gpus),2))
-                save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth.png'), drange=[images_depth.min(), images_depth.max()], grid_size=(int(batch_size/num_gpus),1))
+                else:
+
+                    images = torch.cat((real_img_save['image_src'], gen_img_save['image'].detach()), 0).cpu().numpy()
+                    images_depth = gen_img_save['image_depth'].detach().cpu().numpy()
+
+                    save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=(int(batch_size/num_gpus),2))
+                    save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth.png'), drange=[images_depth.min(), images_depth.max()], grid_size=(int(batch_size/num_gpus),1))
 
                
                
@@ -494,9 +533,13 @@ def training_loop(
             snapshot_data = None
             #(network_snapshot_ticks*10)
             if (network_snapshot_ticks is not None) and (done or cur_tick % (network_snapshot_ticks*5) == 0):
-                snapshot_data = dict(training_set_kwargs=dict(training_set_kwargs))
+                
+                snapshot_data = dict(training_set_kwargs=dict(training_set_kwargs))   
                 
                 check_modules = [('G', G), ('E', E)]
+
+                if 'gan' in loss_selection:
+                    check_modules.append(('D', D))
     
                 for name, module in check_modules:
                     if module is not None:
@@ -505,14 +548,24 @@ def training_loop(
                         module = copy.deepcopy(module).eval().requires_grad_(False).cpu()
                     snapshot_data[name] = module
                     del module # conserve memory
-                #snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
+                
                 snapshot_ckpt_G = os.path.join(run_dir, f'G-snapshot-{cur_nimg//1000:06d}.pth')
-                snapshot_ckpt_D = os.path.join(run_dir, f'D-snapshot-{cur_nimg//1000:06d}.pth')
                 snapshot_ckpt_E = os.path.join(run_dir, f'E-snapshot-{cur_nimg//1000:06d}.pth')
+
+                if 'gan' in loss_selection:
+                    snapshot_ckpt_D = os.path.join(run_dir, f'D-snapshot-{cur_nimg//1000:06d}.pth')
+
+                
                 if rank == 0:
                     torch.save(snapshot_data['G'].state_dict(), snapshot_ckpt_G)
                     torch.save(snapshot_data['E'].state_dict(), snapshot_ckpt_E)
+
+                    if 'gan' in loss_selection:
+                        torch.save(snapshot_data['D'].state_dict(), snapshot_ckpt_D)
+
+                    print('***'*10)
                     print('pickle dumpped!')
+                    print('***'*10)
 
                     #with open(snapshot_pkl, 'wb') as f:
                     #    pickle.dump(snapshot_data, f)
@@ -563,6 +616,7 @@ def training_loop(
             tick_start_nimg = cur_nimg
             tick_start_time = time.time()
             maintenance_time = tick_start_time - tick_end_time
+
             if done:
                 break
 
