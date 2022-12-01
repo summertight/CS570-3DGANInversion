@@ -204,7 +204,7 @@ def training_loop(
     G.register_buffer('dataset_label_std', torch.tensor(training_set.get_label_std()).to(device))
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
-    if mode == 'AE' or mode == 'AE_new':
+    if mode == 'AE' or mode == 'AE_new' or mode=='AE_Platon':
         E = dnnlib.util.construct_class_by_name(**E_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
         E = torch.nn.SyncBatchNorm.convert_sync_batchnorm(E)
     # Load pretrained smthng for finetuning or inversion
@@ -259,7 +259,7 @@ def training_loop(
     # Distribute across GPUs.
     if mode == 'EG3D':
         module_list = [G, D, G_ema, augment_pipe]
-    elif mode == 'AE' or mode == 'AE_new':
+    elif mode == 'AE' or mode == 'AE_new' or mode=='AE_Platon':
         module_list = [E, G]
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
@@ -273,9 +273,9 @@ def training_loop(
     # Setup training phases.
     if rank == 0:
         print('Setting up training phases...')
-    if mode == 'AE' or mode == 'AE_new':
+    if mode == 'AE' or mode == 'AE_new' or mode=='AE_Platon':
         loss = dnnlib.util.construct_class_by_name(device=device, rank=rank, G=G, D=D, E=E, augment_pipe=augment_pipe,\
-            loss_selection = loss_selection, invert_map = invert_map, resolution_encode=resolution_encode, **loss_kwargs) # subclass of training.loss.Loss
+            loss_selection = loss_selection, invert_map = invert_map, resolution_encode=resolution_encode, mode=mode, **loss_kwargs) # subclass of training.loss.Loss
     else:
         loss = dnnlib.util.construct_class_by_name(device=device, G=G, D=D, augment_pipe=augment_pipe, **loss_kwargs) # subclass of training.loss.Loss
     phases = []
@@ -290,7 +290,7 @@ def training_loop(
         opt = dnnlib.util.construct_class_by_name(params=params, **E_opt_kwargs) # subclass of torch.optim.Optimizer
         phases += [dnnlib.EasyDict(name='Gmain', module=[E,G], opt=opt, interval=1)]
 
-    elif mode == 'AE_new':
+    elif mode == 'AE_new' or mode=='AE_Platon':
         #import pdb;pdb.set_trace()
         params = []
         params += list(E.parameters())
@@ -364,7 +364,7 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            if mode == 'AE' or mode=='AE_new':
+            if mode == 'AE' or mode=='AE_new' or mode=='AE_Platon':
                 phase_real_img, phase_real_c = next(training_set_iterator)
                 phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
                 phase_real_c = phase_real_c.to(device).split(batch_gpu)
@@ -379,7 +379,7 @@ def training_loop(
                 all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 
         # Execute training phases.
-        if mode == 'AE'or mode=='AE_new':
+        if mode == 'AE'or mode=='AE_new' or mode=='AE_Platon':
             for phase in phases:
                 if batch_idx % phase.interval != 0:
                     continue

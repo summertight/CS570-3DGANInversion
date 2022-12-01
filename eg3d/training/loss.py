@@ -305,7 +305,7 @@ class StyleGAN2Loss(Loss):
 class StyleGAN2AELoss(Loss):
     def __init__(self, device, rank, G, D, E, augment_pipe=None, blur_init_sigma=0, blur_fade_kimg=0, neural_rendering_resolution_initial=64, \
     neural_rendering_resolution_final=None, neural_rendering_resolution_fade_kimg=0, filter_mode='antialiased', n_random_labels=None,\
-     loss_selection = None,  invert_map=False, resolution_encode = 512,\
+     loss_selection = None,  invert_map=False, resolution_encode = 512, mode='AE',\
      r1_gamma_fade_kimg=0,pl_decay=0.01, r1_gamma=10,style_mixing_prob=0,pl_weight=0, pl_batch_shrink=2,pl_no_weight_grad=False,r1_gamma_init=0,\
      gpc_reg_fade_kimg=1000, gpc_reg_prob=None, dual_discrimination=False, \
      ):
@@ -363,27 +363,30 @@ class StyleGAN2AELoss(Loss):
             self.landmark_detector.eval()
         #breakpoint()
         self.resolution_encode = resolution_encode
+        self.mode = mode
     
     def run_EG(self, img_src, c, neural_rendering_resolution, h_start=None):
         #breakpoint()
 
         #img_src_resized = filtered_resizing(img_src, size=self.resolution_encode, f=self.resample_filter, filter_mode=self.filter_mode)
-        if self.invert_map:
-
-            
-            ws, maps = self.E(img_src)
-
-            #breakpoint()
-            
-            gen_output = self.G.synthesis(ws, maps, c, neural_rendering_resolution=neural_rendering_resolution)
-        else:
-            
+        if self.mode == 'AE_Platon':
             ws = self.E(img_src)
             gen_output = self.G.synthesis(ws, None, c, neural_rendering_resolution=neural_rendering_resolution)
-            if False:
-                c_roll = torch.roll(c.clone(), 1, 0)
-                gen_output_roll = self.G.synthesis(ws, None, c_roll, neural_rendering_resolution=neural_rendering_resolution)
-                return gen_output, gen_output_roll
+                
+        else:
+            if self.invert_map:
+
+                
+                ws, maps = self.E(img_src)
+
+                #breakpoint()
+                
+                gen_output = self.G.synthesis(ws, maps, c, neural_rendering_resolution=neural_rendering_resolution)
+            else:
+                
+                ws = self.E(img_src)
+                gen_output = self.G.synthesis(ws, None, c, neural_rendering_resolution=neural_rendering_resolution)
+                
         return gen_output
 
 
@@ -425,8 +428,14 @@ class StyleGAN2AELoss(Loss):
         # Gmain: L1 Loss and VGG Loss. / Maximize logits for generated images.
         if phase in ['Gmain']:
             with torch.autograd.profiler.record_function('Gmain_forward'):
+                if self.mode == 'AE_Platon':
+                    gen_img_integrated = self.run_EG(real_img['image_src_resized'], c, neural_rendering_resolution=neural_rendering_resolution)
+                    gen_img = gen_img_integrated['src']
+                    gen_img_roll = gen_img_integrated['roll']
+                #gen
+                else:
 
-                gen_img = self.run_EG(real_img['image_src_resized'], c, neural_rendering_resolution=neural_rendering_resolution)
+                    gen_img = self.run_EG(real_img['image_src_resized'], c, neural_rendering_resolution=neural_rendering_resolution)
                 #gen_img = self.run_EG(real_img['image_src'], c, neural_rendering_resolution=neural_rendering_resolution)
 
                 # L1 Loss
@@ -485,11 +494,16 @@ class StyleGAN2AELoss(Loss):
                     
                 if 'gan' in self.loss_selection:
                 
-                        
-                    gen_logits = self.run_D(gen_img, c, blur_sigma=blur_sigma)
-                    loss_gan = torch.nn.functional.softplus(-gen_logits)
-                    loss_Gmain += loss_gan.mean()
-                    training_stats.report('Loss/LIA3D/loss_ganG', loss_gan.mean())
+                    if self.mode == 'AE_Platon':
+                        gen_logits = self.run_D(gen_img_roll, c, blur_sigma=blur_sigma)
+                        loss_gan = torch.nn.functional.softplus(-gen_logits)
+                        loss_Gmain += loss_gan.mean()
+                        training_stats.report('Loss/loss_ganG', loss_gan.mean())
+                    else:
+                        gen_logits = self.run_D(gen_img, c, blur_sigma=blur_sigma)
+                        loss_gan = torch.nn.functional.softplus(-gen_logits)
+                        loss_Gmain += loss_gan.mean()
+                        training_stats.report('Loss/loss_ganG', loss_gan.mean())
      
                 
             with torch.autograd.profiler.record_function('Gmain_backward'):
@@ -502,28 +516,19 @@ class StyleGAN2AELoss(Loss):
             loss_Dgen = 0
             if phase in ['Dmain']:
                 with torch.autograd.profiler.record_function('Dgen_forward'):
-                    if self.encoder_type=='self_cross':
-                        gen_img = self.run_G_double(real_img['image_src'], real_img['image_drv'], c, neural_rendering_resolution=neural_rendering_resolution)
-                        gen_logits = self.run_D_double(gen_img, c, blur_sigma=blur_sigma)
-
-                        training_stats.report('Loss/scores/fake_self', gen_logits[0])
-                        training_stats.report('Loss/signs/fake_self', gen_logits[0].sign())
-                        training_stats.report('Loss/scores/fake_cross', gen_logits[1])
-                        training_stats.report('Loss/signs/fake_cross', gen_logits[1].sign())
-                        loss_Dgen_self = torch.nn.functional.softplus(gen_logits[0])
-                        loss_Dgen_cross = torch.nn.functional.softplus(gen_logits[1])
-                        loss_Dgen = loss_Dgen_self+loss_Dgen_cross
-
+                    if self.mode == 'AE_Platon':
+                        gen_img = self.run_G(real_img['image_src'], real_img['image_drv'], c, neural_rendering_resolution=neural_rendering_resolution)['roll']
+                    
                     else:
-                            
-                        gen_img = self.run_G(real_img['image_src'], real_img['image_drv'], c, neural_rendering_resolution=neural_rendering_resolution)
-                        gen_logits = self.run_D(gen_img, c, blur_sigma=blur_sigma)
 
-                        training_stats.report('Loss/scores/fake', gen_logits)
-                        training_stats.report('Loss/signs/fake', gen_logits.sign())
-                        
-                        loss_Dgen = torch.nn.functional.softplus(gen_logits)
-                
+                        gen_img = self.run_G(real_img['image_src'], real_img['image_drv'], c, neural_rendering_resolution=neural_rendering_resolution)
+                    gen_logits = self.run_D(gen_img, c, blur_sigma=blur_sigma)
+
+                    training_stats.report('Loss/scores/fake', gen_logits)
+                    training_stats.report('Loss/signs/fake', gen_logits.sign())
+                    
+                    loss_Dgen = torch.nn.functional.softplus(gen_logits)
+            
                 with torch.autograd.profiler.record_function('Dgen_backward'):
                     
                     loss_Dgen.mean().mul(gain).backward()

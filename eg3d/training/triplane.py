@@ -88,6 +88,83 @@ class TriPlaneGenerator(torch.nn.Module):
 
         return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}
     
+    def synthesis_with_roll(self, ws, maps=None, c=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
+        '''
+        cam2world_matrix = c[:, :16].view(-1, 4, 4)
+        intrinsics = c[:, 16:25].view(-1, 3, 3)#XXX fixed
+
+        if neural_rendering_resolution is None:
+            neural_rendering_resolution = self.neural_rendering_resolution
+        else:
+            self.neural_rendering_resolution = neural_rendering_resolution
+
+        # Create a batch of rays for volume rendering
+        ray_origins, ray_directions = self.ray_sampler(cam2world_matrix, intrinsics, neural_rendering_resolution)
+        '''
+        c_roll = torch.roll(c.clone(), 1, 0)
+
+        ray_origins, ray_directions = self.ray_sample_integrated(c, neural_rendering_resolution)
+
+        ray_origins_roll, ray_directions_roll = self.ray_sample_integrated(c_roll, neural_rendering_resolution)
+        # Create triplanes by running StyleGAN backbone
+        N, M, _ = ray_origins.shape
+        if use_cached_backbone and self._last_planes is not None:
+            planes = self._last_planes
+        else:
+            planes = self.backbone.synthesis(ws, maps, update_emas=update_emas, **synthesis_kwargs)
+        if cache_backbone:
+            self._last_planes = planes
+
+        # Reshape output into three 32-channel planes
+        planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
+
+
+        out_dict = self.neural_render_integrated(planes,ws,ray_origins,ray_directions)
+        out_roll_dict = self.neural_render_integrated(planes,ws,ray_origins_roll,ray_directions_roll)
+
+        out_integrated = {'src': out_dict, 'roll': out_roll_dict }
+        '''
+        # Perform volume rendering
+        feature_samples, depth_samples, weights_samples = self.renderer(planes, self.decoder, ray_origins, ray_directions, self.rendering_kwargs) # channels last
+
+        # Reshape into 'raw' neural-rendered image
+        H = W = self.neural_rendering_resolution
+        feature_image = feature_samples.permute(0, 2, 1).reshape(N, feature_samples.shape[-1], H, W).contiguous()
+        depth_image = depth_samples.permute(0, 2, 1).reshape(N, 1, H, W)
+
+        # Run superresolution to get final image
+        rgb_image = feature_image[:, :3]
+        sr_image = self.superresolution(rgb_image, feature_image, ws, noise_mode=self.rendering_kwargs['superresolution_noise_mode'], **{k:synthesis_kwargs[k] for k in synthesis_kwargs.keys() if k != 'noise_mode'})
+        '''
+        return out_integrated
+        #return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}
+    
+    def ray_sample_integrated(self, c=None, neural_rendering_resolution=None):
+        cam2world_matrix = c[:, :16].view(-1, 4, 4)
+        intrinsics = c[:, 16:25].view(-1, 3, 3)#XXX fixed
+
+        if neural_rendering_resolution is None:
+            neural_rendering_resolution = self.neural_rendering_resolution
+        else:
+            self.neural_rendering_resolution = neural_rendering_resolution
+
+        ray_origins, ray_directions = self.ray_sampler(cam2world_matrix, intrinsics, neural_rendering_resolution)
+        return ray_origins, ray_directions
+
+    def neural_render_integrated(self, planes, ws, ray_origins, ray_directions):
+
+        feature_samples, depth_samples, weights_samples = self.renderer(planes, self.decoder, ray_origins, ray_directions, self.rendering_kwargs) # channels last
+        H = W = self.neural_rendering_resolution
+        N, M, _ = ray_origins.shape
+        feature_image = feature_samples.permute(0, 2, 1).reshape(N, feature_samples.shape[-1], H, W).contiguous()
+        depth_image = depth_samples.permute(0, 2, 1).reshape(N, 1, H, W)
+
+        # Run superresolution to get final image
+        rgb_image = feature_image[:, :3]
+        sr_image = self.superresolution(rgb_image, feature_image, ws, noise_mode=self.rendering_kwargs['superresolution_noise_mode'], **{k:synthesis_kwargs[k] for k in synthesis_kwargs.keys() if k != 'noise_mode'})
+        
+        return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}
+
     def sample(self, coordinates, directions, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
         # Compute RGB features, density for arbitrary 3D coordinates. Mostly used for extracting shapes. 
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)

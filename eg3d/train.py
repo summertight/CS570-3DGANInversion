@@ -133,8 +133,8 @@ def parse_comma_separated_list(s):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=str, required=True)
-@click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=str, default='ffhq')
+@click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, default='/home/nas2_userG/junhahyung/FFHQ_png_512.zip')
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
 @click.option('--gamma',        help='R1 regularization weight', metavar='FLOAT',               type=click.FloatRange(min=0), required=True)
@@ -175,7 +175,7 @@ def parse_comma_separated_list(s):
 @click.option('--neural_rendering_resolution_fade_kimg', help='Kimg to blend resolution over', metavar='INT',  type=click.IntRange(min=0), required=False, default=1000, show_default=True)
 
 @click.option('--blur_fade_kimg', help='Blur over how many', metavar='INT',  type=click.IntRange(min=1), required=False, default=200)
-@click.option('--gen_pose_cond', help='If true, enable generator pose conditioning.', metavar='BOOL',  type=bool, required=False, default=False)
+@click.option('--gen_pose_cond', help='If true, enable generator pose conditioning.', metavar='BOOL',  type=bool, required=False, default=True)
 @click.option('--c-scale', help='Scale factor for generator pose conditioning.', metavar='FLOAT',  type=click.FloatRange(min=0), required=False, default=1)
 @click.option('--c-noise', help='Add noise for generator pose conditioning.', metavar='FLOAT',  type=click.FloatRange(min=0), required=False, default=0)
 @click.option('--gpc_reg_prob', help='Strength of swapping regularization. None means no generator pose conditioning, i.e. condition with zeros.', metavar='FLOAT',  type=click.FloatRange(min=0), required=False, default=0.5)
@@ -247,7 +247,7 @@ def main(**kwargs):
     c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
-    if opts.mode == 'AE' or opts.mode == 'AE_new':
+    if opts.mode == 'AE' or opts.mode == 'AE_new' or opts.mode == 'AE_Platon':
         c.mode = opts.mode
         c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder',\
                 img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
