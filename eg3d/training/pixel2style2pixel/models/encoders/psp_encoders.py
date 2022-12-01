@@ -88,12 +88,14 @@ class GradualStyleEncoder(Module):
                                            bottleneck.stride))
         self.body = Sequential(*modules)
         if w_type == 'w+':
+            n_styles=14
             self.styles = nn.ModuleList()
             self.style_count = n_styles  # int(math.log(self.opts.output_size, 2)) * 2 - 2     # 
             self.coarse_ind = 3
             self.middle_ind = 7
             #breakpoint()
         elif w_type == 'w++':
+            
             n_styles = 20
             self.styles = nn.ModuleList()
             self.style_count = n_styles  # int(math.log(self.opts.output_size, 2)) * 2 - 2     # 
@@ -152,13 +154,7 @@ class GradualStyleEncoder(Module):
         _, _, H, W = y.size()
         return F.interpolate(x, size=(H, W), mode='bilinear', align_corners=True) + y
 
-    def forward(self, src, tgt=None):
-        if tgt is None:
-            x = src
-        else:
-            #breakpoint()
-            x = torch.cat((src, tgt),axis=0)
-            #pass
+    def forward(self, x):
         x = self.input_layer(x)
 
         latents = []
@@ -209,14 +205,14 @@ class GradualStyleEncoder(Module):
             #        out_maps.append(self.noises[idx](c3))
             #    if idx==1:
             #        out_maps.append(self.noises[idx](p2))
-            #breakpoint()
+            
             return out, out_maps
 
     
                 #pass
         return out
-    def encode(self, x_src, x_tgt):
-        return self.forward(x_src, x_tgt)
+    def encode(self,x):
+        return self.forward(x)
         
 
 class BackboneEncoderUsingLastLayerIntoW(Module):

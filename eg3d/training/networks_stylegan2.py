@@ -46,13 +46,9 @@ def modulated_conv2d(
 ):
     batch_size = x.shape[0]
     out_channels, in_channels, kh, kw = weight.shape
-    #breakpoint()
     misc.assert_shape(weight, [out_channels, in_channels, kh, kw]) # [OIkk]
     misc.assert_shape(x, [batch_size, in_channels, None, None]) # [NIHW]
-    #try:
     misc.assert_shape(styles, [batch_size, in_channels]) # [NI]
-    #except:
-    #    print(styles.shape, batch_size, in_channels)
 
     # Pre-normalize inputs to avoid FP16 overflow.
     if x.dtype == torch.float16 and demodulate:
@@ -546,7 +542,6 @@ class SynthesisNetwork(torch.nn.Module):
                     w_idx += block.num_conv
             else:#W++
                 misc.assert_shape(ws, [None, self.num_ws//2*3-1, self.w_dim])
-                #import pdb;pdb.set_trace()
                 ws = ws.to(torch.float32)
                 for res in self.block_resolutions:
                     res = int(res)
@@ -559,7 +554,7 @@ class SynthesisNetwork(torch.nn.Module):
                         #print(ws.narrow(1, int(np.log2(res))*3-7 , 3).shape)
                     #print(np.log2(res)*3-7,np.log2(res)*3-4)
                     #import pdb;pdb.set_trace()
-                #breakpoint()
+                
             
         #import pdb;pdb.set_trace()
         #import pdb;pdb.set_trace()

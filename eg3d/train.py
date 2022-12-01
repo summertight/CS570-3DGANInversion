@@ -109,7 +109,7 @@ def launch_training(c, desc, outdir, dry_run):
 
 def init_dataset_kwargs(data, mode):
     try:
-        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False, mode=mode)
+        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False) #mode=mode)
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
         dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
         dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
@@ -162,7 +162,7 @@ def parse_comma_separated_list(s):
 @click.option('--metrics',      help='Quality metrics', metavar='[NAME|A,B,C|none]',            type=parse_comma_separated_list, default='fid50k_full', show_default=True)
 @click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=25000, show_default=True)
 @click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
-@click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
+@click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=5, show_default=True)
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 # @click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 type=bool, default=False, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
@@ -195,14 +195,18 @@ def parse_comma_separated_list(s):
 @click.option('--density_reg_p_dist',    help='density regularization strength.', metavar='FLOAT', type=click.FloatRange(min=0), default=0.004, required=False, show_default=True)
 @click.option('--reg_type', help='Type of regularization', metavar='STR',  type=click.Choice(['l1', 'l1-alt', 'monotonic-detach', 'monotonic-fixed', 'total-variation']), required=False, default='l1')
 @click.option('--decoder_lr_mul',    help='decoder learning rate multiplier.', metavar='FLOAT', type=click.FloatRange(min=0), default=1, required=False, show_default=True)
-@click.option('--mode', help='autoencoder or eg3d', metavar='STR',  type=click.Choice(['AE', 'EG3D', 'MFIM']), required=True, default='AE')
+@click.option('--mode', help='autoencoder or eg3d', metavar='STR',  type=click.Choice(['AE', 'EG3D', 'MFIM', 'E_warmup_w+','E_warmup_w++', 'E_warmup_w++_map','AE_new']), required=True, default='AE')
 @click.option('--pretrain', help='autoencoder or eg3d', metavar='STR',  type=str,  default=None)
-@click.option('--loss_selection', type=click.Choice(['vgg','l1','id', 'gan','deca']), multiple=True)
+#@click.option('--loss_selection', type=click.Choice(['vgg','l1','id', 'gan','deca']), multiple=True)
+@click.option('--loss_selection', type=(str,float) , default =[('l1',1),('deca',5)],multiple=True)
 @click.option('--block_selection', type=click.Choice(['4','8','16','32','64','128','256']), multiple=True)
 @click.option('--invert_map', type=bool, default=False)
 @click.option('--resolution_encode', help='encode resolution', metavar='INT',  type=int,  default=256)
 @click.option('--w_type', type=click.Choice(['w+', 'w++']), metavar='STR', default='w+')
-
+@click.option('--lr_e', help='E',   default = 0.0001, type=click.FloatRange(min=0))
+@click.option('--lr_g', help='G',   default = 0.0001,type=click.FloatRange(min=0))
+@click.option('--lr_d', help='D',  default = 0.0001, type=click.FloatRange(min=0))
+#XXX 클릭 옵션은 소문자만 취급
 
 #XXX DEBUG LINE: python train.py --outdir=~/training-runs --cfg=ffhq --data=./inthewild_data --gpus=1 --batch 4 --gamma 1 --gen_pose_cond True --loss_selection l1 --workers 0 --pretrain /home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl
 #XXX DECA DEBUG LINE: python train.py --outdir=./training-runs_ae --cfg=ffhq --data=./inthewild_data --gpus=1 --batch 4 --gamma 1 --gen_pose_cond True --loss_selection l1 --workers 0 --block_selection 16 --block_selection 32 --pretrain /home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl --loss_selection l1 --loss_selection deca
@@ -243,25 +247,33 @@ def main(**kwargs):
     c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
-    if opts.mode == 'AE':
+    if opts.mode == 'AE' or opts.mode == 'AE_new':
         c.mode = opts.mode
-        #breakpoint()
-        #c.block_selections = opts.block_selection
-        #c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder',\
-        c.E_kwargs = dnnlib.EasyDict(class_name='training.psp_encoders_cp.GradualStyleEncoder',\
-        
-                n_styles=14, img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
+        c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder',\
+                img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
         c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
         c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2AELoss')
     elif opts.mode == 'MFIM':
         c.mode = opts.mode
-        #breakpoint()
-        #c.block_selections = opts.block_selection
-        #c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder',\
         c.E_kwargs = dnnlib.EasyDict(class_name='training.psp_encoders_cp.GradualStyleEncoder',\
-                n_styles=14, img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
+                img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
         c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
         c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2SwapLoss')
+    elif opts.mode == 'StyleSWAP':
+        c.mode = opts.mode
+        c.E_kwargs = dnnlib.EasyDict(class_name='training.psp_encoders_cp.GradualStyleEncoder',\
+                img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
+        c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+        
+        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2StyleSwapLoss')
+    elif opts.mode == 'E_warmup_w+' or opts.mode == 'E_warmup_w++' or opts.mode == 'E_warmup_w++_map':
+        c.mode = opts.mode
+        c.E_kwargs = dnnlib.EasyDict(class_name='training.psp_encoders_cp.GradualStyleEncoder',\
+                img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
+        c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2SwapLoss')
+
+        
     # Training set.
     c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data, mode=opts.mode)
     if opts.cond and not c.training_set_kwargs.use_labels:
@@ -273,7 +285,7 @@ def main(**kwargs):
     ##
     c.mode = opts.mode
     c.pretrain = opts.pretrain
-    c.loss_selection = opts.loss_selection
+    c.loss_selection = dict(opts.loss_selection)
     c.invert_map = opts.invert_map
     c.resolution_encode = opts.resolution_encode
     ##
@@ -286,9 +298,11 @@ def main(**kwargs):
     c.D_kwargs.block_kwargs.freeze_layers = opts.freezed
     c.D_kwargs.epilogue_kwargs.mbstd_group_size = opts.mbstd_group
     c.loss_kwargs.r1_gamma = opts.gamma
-    c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
-    c.D_opt_kwargs.lr = opts.dlr
-    c.E_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
+    #breakpoint()
+    c.G_opt_kwargs.lr = opts.lr_g
+    c.D_opt_kwargs.lr = opts.lr_d
+    c.E_opt_kwargs.lr = opts.lr_e
+    #c.E_opt_kwargs.lr =dlr(0.002 if op ts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
