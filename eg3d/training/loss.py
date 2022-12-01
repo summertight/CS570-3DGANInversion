@@ -411,7 +411,9 @@ class StyleGAN2AELoss(Loss):
 
     def accumulate_gradients(self, phase, img_src, c, gain, cur_nimg ):
         assert phase in ['Gmain', 'Dmain']
-        
+
+        r1_gamma = self.r1_gamma
+
         blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
 
         if self.neural_rendering_resolution_final is not None:
@@ -491,37 +493,54 @@ class StyleGAN2AELoss(Loss):
                     training_stats.report('Loss/LIA3D/loss_3dmm_shape', loss_3dmm_shape)
                     training_stats.report('Loss/LIA3D/loss_3dmm_exp', loss_3dmm_exp)
 
-                    
+                # Gmain: Maximize logits for generated images.
                 if 'gan' in self.loss_selection:
                 
                     if self.mode == 'AE_Platon':
                         gen_logits = self.run_D(gen_img_roll, c, blur_sigma=blur_sigma)
-                        loss_gan = torch.nn.functional.softplus(-gen_logits)
-                        loss_Gmain += loss_gan.mean()
-                        training_stats.report('Loss/loss_ganG', loss_gan.mean())
+                        loss_ganG = torch.nn.functional.softplus(-gen_logits)
+                        loss_Gmain += self.loss_selection['gan']*loss_ganG.mean()
+                        training_stats.report('Loss/loss_ganG', loss_ganG.mean())
                     else:
                         gen_logits = self.run_D(gen_img, c, blur_sigma=blur_sigma)
-                        loss_gan = torch.nn.functional.softplus(-gen_logits)
-                        loss_Gmain += loss_gan.mean()
-                        training_stats.report('Loss/loss_ganG', loss_gan.mean())
-     
+                        loss_ganG = torch.nn.functional.softplus(-gen_logits)
+                        loss_Gmain += loss_ganG.mean()
+                        training_stats.report('Loss/loss_ganG', loss_ganG.mean())
+
+
                 
             with torch.autograd.profiler.record_function('Gmain_backward'):
                 loss_Gmain.mean().mul(gain).backward()
 
-
-        # Dmain: Minimize logits for generated images.
         if 'gan' in self.loss_selection:
+            if phase in ['Greg'] and self.G.rendering_kwargs.get('density_reg', 0) > 0 and self.G.rendering_kwargs['reg_type'] == 'l1':
+                    
 
+                ws = self.E(real_img['image_src_resized'])
+                initial_coordinates = torch.rand((ws.shape[0], 1000, 3), device=ws.device) * 2 - 1
+                perturbed_coordinates = initial_coordinates + torch.randn_like(initial_coordinates) * self.G.rendering_kwargs['density_reg_p_dist']
+                all_coordinates = torch.cat([initial_coordinates, perturbed_coordinates], dim=1)
+                sigma = self.G.sample_mixed(all_coordinates, torch.randn_like(all_coordinates), ws, update_emas=False)['sigma']
+                sigma_initial = sigma[:, :sigma.shape[1]//2]
+                sigma_perturbed = sigma[:, sigma.shape[1]//2:]
+
+                TVloss = torch.nn.functional.l1_loss(sigma_initial, sigma_perturbed) * self.G.rendering_kwargs['density_reg']
+                TVloss.mul(gain).backward()
+
+
+        
+        if 'gan' in self.loss_selection:
+            # Dmain: Minimize logits for generated images.
             loss_Dgen = 0
             if phase in ['Dmain']:
                 with torch.autograd.profiler.record_function('Dgen_forward'):
                     if self.mode == 'AE_Platon':
-                        gen_img = self.run_G(real_img['image_src'], real_img['image_drv'], c, neural_rendering_resolution=neural_rendering_resolution)['roll']
+                        gen_img = self.run_EG(real_img['image_src_resized'], c, neural_rendering_resolution=neural_rendering_resolution)['roll']
                     
                     else:
 
-                        gen_img = self.run_G(real_img['image_src'], real_img['image_drv'], c, neural_rendering_resolution=neural_rendering_resolution)
+                        gen_img = self.run_EG(real_img['image_src_resezed'],  c, neural_rendering_resolution=neural_rendering_resolution)
+                    
                     gen_logits = self.run_D(gen_img, c, blur_sigma=blur_sigma)
 
                     training_stats.report('Loss/scores/fake', gen_logits)
@@ -533,35 +552,43 @@ class StyleGAN2AELoss(Loss):
                     
                     loss_Dgen.mean().mul(gain).backward()
             # Dmain: Maximize logits for real images.
-            if phase in ['Dmain']:
-                with torch.autograd.profiler.record_function('Dreal_forward'):
-                    real_img_tmp_image_self = real_img['image_drv'].detach().requires_grad_(False)
-                    real_img_tmp_image_raw_self = real_img['image_drv_raw'].detach().requires_grad_(False)
-                    real_img_tmp_image_cross = real_img['image_drv'].detach().requires_grad_(False)
-                    real_img_tmp_image_raw_cross = real_img['image_drv_raw'].detach().requires_grad_(False)
-                    real_img_tmp = {'image': real_img_tmp_image_self, 'image_raw': real_img_tmp_image_raw_self, 'image_cross':real_img_tmp_image_cross,'image_raw_cross':real_img_tmp_image_raw_cross}
+            if phase in ['Dmain', 'Dreg']:
+                name = 'Dreal' if phase=='Dmain' else 'Dreal_Dr1'
+                with torch.autograd.profiler.record_function(f'{name}_forward'):
+                    real_img_tmp_image = real_img['image'].detach().requires_grad_(phase in ['Dreg'])
+                    real_img_tmp_image_raw = real_img['image_raw'].detach().requires_grad_(phase in ['Dreg'])
+                    real_img_tmp = {'image': real_img_tmp_image, 'image_raw': real_img_tmp_image_raw}
 
-                    real_logits = self.run_D_double(real_img_tmp, c, blur_sigma=blur_sigma)
-                    
+                    real_logits = self.run_D(real_img_tmp, c, blur_sigma=blur_sigma)
+                    training_stats.report('Loss/scores/real', real_logits)
+                    training_stats.report('Loss/signs/real', real_logits.sign())
+
                     loss_Dreal = 0
-                    #loss_Dreal = torch.nn.functional.softplus(-real_logits)
+                    if phase in ['Dmain']:
+                        loss_Dreal = torch.nn.functional.softplus(-real_logits)
+                        training_stats.report('Loss/D/loss', loss_Dgen + loss_Dreal)
 
-                    loss_Dreal_self = torch.nn.functional.softplus(-real_logits[0])
-                    loss_Dreal_cross = torch.nn.functional.softplus(-real_logits[1])
-                    loss_Dreal = loss_Dreal_self+loss_Dreal_cross
-                    
-                    training_stats.report('Loss/scores/real_self', real_logits[0])
-                    training_stats.report('Loss/signs/real_self', real_logits[0].sign())
-                    training_stats.report('Loss/scores/real_fake', real_logits[1])
-                    training_stats.report('Loss/signs/real_fake', real_logits[1].sign())
-                 
-                    if self.encoder_type =='self_cross':
-                        training_stats.report('Loss/LIA3D/loss_ganD', loss_Dgen_self.mean() +loss_Dgen_cross.mean() + loss_Dreal.mean())
+                    loss_Dr1 = 0
+                    if phase in ['Dreg']:
+                        if self.dual_discrimination:
+                            with torch.autograd.profiler.record_function('r1_grads'), conv2d_gradfix.no_weight_gradients():
+                                r1_grads = torch.autograd.grad(outputs=[real_logits.sum()], inputs=[real_img_tmp['image'], real_img_tmp['image_raw']], create_graph=True, only_inputs=True)
+                                r1_grads_image = r1_grads[0]
+                                r1_grads_image_raw = r1_grads[1]
+                            r1_penalty = r1_grads_image.square().sum([1,2,3]) + r1_grads_image_raw.square().sum([1,2,3])
+                        else: # single discrimination
+                            with torch.autograd.profiler.record_function('r1_grads'), conv2d_gradfix.no_weight_gradients():
+                                r1_grads = torch.autograd.grad(outputs=[real_logits.sum()], inputs=[real_img_tmp['image']], create_graph=True, only_inputs=True)
+                                r1_grads_image = r1_grads[0]
+                            r1_penalty = r1_grads_image.square().sum([1,2,3])
+                        loss_Dr1 = r1_penalty * (r1_gamma / 2)
+                        training_stats.report('Loss/r1_penalty', r1_penalty)
+                        training_stats.report('Loss/D/reg', loss_Dr1)
 
-                    else:
-                        training_stats.report('Loss/LIA3D/loss_ganD', loss_Dgen + loss_Dreal)
-
-                with torch.autograd.profiler.record_function('Dreal_backward'):
-                    (loss_Dreal).mean().mul(gain).backward()
+                with torch.autograd.profiler.record_function(name + '_backward'):
+                    (loss_Dreal + loss_Dr1).mean().mul(gain).backward()
         
+        if self.mode == 'AE_Platon':
+            return real_img, gen_img_integrated
+
         return real_img, gen_img
