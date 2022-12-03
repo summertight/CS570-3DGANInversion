@@ -314,16 +314,30 @@ def training_loop(
         params += list(G.backbone.parameters())
         
         opt = dnnlib.util.construct_class_by_name(params=params, **E_opt_kwargs) # subclass of torch.optim.Optimizer
-        phases += [dnnlib.EasyDict(name='Gmain', module=[E,G], opt=opt, interval=1)]
-
+        #phases += [dnnlib.EasyDict(name='Gmain', module=[E,G], opt=opt, interval=1)]
         if 'gan' in loss_selection:
+            opt_list = [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]
+        else:
+            opt_list = [('G', G, G_opt_kwargs, G_reg_interval)]
+        for name, module, opt_kwargs, reg_interval in opt_list:
+            
+            
+            
             mb_ratio = reg_interval / (reg_interval + 1)
             opt_kwargs = dnnlib.EasyDict(opt_kwargs)
             opt_kwargs.lr = opt_kwargs.lr * mb_ratio
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
-            opt = dnnlib.util.construct_class_by_name(D.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
-            phases += [dnnlib.EasyDict(name=name+'main', module=[D], opt=opt, interval=1)]
-            phases += [dnnlib.EasyDict(name=name+'reg', module=[D], opt=opt, interval=reg_interval)]
+
+            if name == 'G':
+                opt = dnnlib.util.construct_class_by_name(module.backbone.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            else:
+                opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+           
+            if (name == 'G') and ('tv' in loss_selection):
+                phases += [dnnlib.EasyDict(name=name+'reg', module=[module], opt=opt, interval=reg_interval)]
+
+            phases += [dnnlib.EasyDict(name=name+'main', module=[module], opt=opt, interval=1)]
+            
 
     else:
         for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
@@ -426,9 +440,13 @@ def training_loop(
                     module.requires_grad_(True)
 
                 for real_img, real_c in zip(phase_real_img, phase_real_c):
-                    real_img_save, gen_img_save = \
+                    
+                    if phase.name == 'Gmain':
+                        real_img_save, gen_img_save = \
+                            loss.accumulate_gradients(phase=phase.name, img_src=real_img, c=real_c, gain=phase.interval, cur_nimg=cur_nimg)
+                    else:
                         loss.accumulate_gradients(phase=phase.name, img_src=real_img, c=real_c, gain=phase.interval, cur_nimg=cur_nimg)
-                
+                   
                 for module in phase.module:
                     module.requires_grad_(False)
                 

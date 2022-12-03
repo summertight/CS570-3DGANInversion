@@ -365,13 +365,13 @@ class StyleGAN2AELoss(Loss):
         self.resolution_encode = resolution_encode
         self.mode = mode
     
-    def run_EG(self, img_src, c, neural_rendering_resolution, h_start=None):
+    def run_EG(self, img_src, c, neural_rendering_resolution):
         #breakpoint()
 
         #img_src_resized = filtered_resizing(img_src, size=self.resolution_encode, f=self.resample_filter, filter_mode=self.filter_mode)
         if self.mode == 'AE_Platon':
             ws = self.E(img_src)
-            gen_output = self.G.synthesis(ws, None, c, neural_rendering_resolution=neural_rendering_resolution)
+            gen_output = self.G.synthesis_with_roll(ws, None, c, neural_rendering_resolution=neural_rendering_resolution)
                 
         else:
             if self.invert_map:
@@ -410,7 +410,7 @@ class StyleGAN2AELoss(Loss):
 
 
     def accumulate_gradients(self, phase, img_src, c, gain, cur_nimg ):
-        assert phase in ['Gmain', 'Dmain']
+        assert phase in ['Gmain', 'Dmain','Greg','Dreg']
 
         r1_gamma = self.r1_gamma
 
@@ -467,10 +467,18 @@ class StyleGAN2AELoss(Loss):
                 
                 # TODO: Commit ID Loss
                 if 'id' in self.loss_selection:
+
+                    if self.mode == 'AE_Platon':
+                        
+                        loss_id = self.criterion_ID(gen_img_roll['image'], real_img['image_src']).mean()
+                        loss_Gmain += self.loss_selection['id'] * loss_id
+                        training_stats.report('Loss/loss_ID_for_roll', loss_id)
                     
-                    loss_id = self.criterion_ID(gen_img['image'], real_img['image_src']).mean()
-                    loss_Gmain += self.loss_selection['id'] * loss_id
-                    training_stats.report('Loss/loss_ID', loss_id)
+                    else:
+
+                        loss_id = self.criterion_ID(gen_img['image'], real_img['image_src']).mean()
+                        loss_Gmain += self.loss_selection['id'] * loss_id
+                        training_stats.report('Loss/loss_ID', loss_id)
                 
                 if 'deca' in self.loss_selection:
                     
@@ -512,20 +520,22 @@ class StyleGAN2AELoss(Loss):
             with torch.autograd.profiler.record_function('Gmain_backward'):
                 loss_Gmain.mean().mul(gain).backward()
 
-        if 'gan' in self.loss_selection:
-            if phase in ['Greg'] and self.G.rendering_kwargs.get('density_reg', 0) > 0 and self.G.rendering_kwargs['reg_type'] == 'l1':
-                    
+        
+        if phase in ['Greg'] and self.G.rendering_kwargs.get('density_reg', 0) > 0 and self.G.rendering_kwargs['reg_type'] == 'l1':
+                
 
-                ws = self.E(real_img['image_src_resized'])
-                initial_coordinates = torch.rand((ws.shape[0], 1000, 3), device=ws.device) * 2 - 1
-                perturbed_coordinates = initial_coordinates + torch.randn_like(initial_coordinates) * self.G.rendering_kwargs['density_reg_p_dist']
-                all_coordinates = torch.cat([initial_coordinates, perturbed_coordinates], dim=1)
-                sigma = self.G.sample_mixed(all_coordinates, torch.randn_like(all_coordinates), ws, update_emas=False)['sigma']
-                sigma_initial = sigma[:, :sigma.shape[1]//2]
-                sigma_perturbed = sigma[:, sigma.shape[1]//2:]
+            ws = self.E(real_img['image_src_resized'])
+            initial_coordinates = torch.rand((ws.shape[0], 1000, 3), device=ws.device) * 2 - 1
+            perturbed_coordinates = initial_coordinates + torch.randn_like(initial_coordinates) * self.G.rendering_kwargs['density_reg_p_dist']
+            all_coordinates = torch.cat([initial_coordinates, perturbed_coordinates], dim=1)
+            sigma = self.G.sample_mixed(all_coordinates, torch.randn_like(all_coordinates), ws, update_emas=False)['sigma']
+            sigma_initial = sigma[:, :sigma.shape[1]//2]
+            sigma_perturbed = sigma[:, sigma.shape[1]//2:]
 
-                TVloss = torch.nn.functional.l1_loss(sigma_initial, sigma_perturbed) * self.G.rendering_kwargs['density_reg']
-                TVloss.mul(gain).backward()
+            TVloss = torch.nn.functional.l1_loss(sigma_initial, sigma_perturbed) * self.G.rendering_kwargs['density_reg']
+
+            training_stats.report('Loss/loss_TV', TVloss.mean())
+            TVloss.mul(gain).backward()
 
 
         
@@ -539,7 +549,7 @@ class StyleGAN2AELoss(Loss):
                     
                     else:
 
-                        gen_img = self.run_EG(real_img['image_src_resezed'],  c, neural_rendering_resolution=neural_rendering_resolution)
+                        gen_img = self.run_EG(real_img['image_src_resized'],  c, neural_rendering_resolution=neural_rendering_resolution)
                     
                     gen_logits = self.run_D(gen_img, c, blur_sigma=blur_sigma)
 
@@ -555,8 +565,8 @@ class StyleGAN2AELoss(Loss):
             if phase in ['Dmain', 'Dreg']:
                 name = 'Dreal' if phase=='Dmain' else 'Dreal_Dr1'
                 with torch.autograd.profiler.record_function(f'{name}_forward'):
-                    real_img_tmp_image = real_img['image'].detach().requires_grad_(phase in ['Dreg'])
-                    real_img_tmp_image_raw = real_img['image_raw'].detach().requires_grad_(phase in ['Dreg'])
+                    real_img_tmp_image = real_img['image_src'].detach().requires_grad_(phase in ['Dreg'])
+                    real_img_tmp_image_raw = real_img['image_src_raw'].detach().requires_grad_(phase in ['Dreg'])
                     real_img_tmp = {'image': real_img_tmp_image, 'image_raw': real_img_tmp_image_raw}
 
                     real_logits = self.run_D(real_img_tmp, c, blur_sigma=blur_sigma)
@@ -588,7 +598,10 @@ class StyleGAN2AELoss(Loss):
                 with torch.autograd.profiler.record_function(name + '_backward'):
                     (loss_Dreal + loss_Dr1).mean().mul(gain).backward()
         
-        if self.mode == 'AE_Platon':
-            return real_img, gen_img_integrated
+        if self.mode == 'AE_Platon' :
+            if (phase in ['Gmain']):
+                return real_img, gen_img_integrated
+            else:
+                return
 
         return real_img, gen_img

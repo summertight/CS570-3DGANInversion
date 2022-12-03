@@ -195,7 +195,7 @@ def parse_comma_separated_list(s):
 @click.option('--density_reg_p_dist',    help='density regularization strength.', metavar='FLOAT', type=click.FloatRange(min=0), default=0.004, required=False, show_default=True)
 @click.option('--reg_type', help='Type of regularization', metavar='STR',  type=click.Choice(['l1', 'l1-alt', 'monotonic-detach', 'monotonic-fixed', 'total-variation']), required=False, default='l1')
 @click.option('--decoder_lr_mul',    help='decoder learning rate multiplier.', metavar='FLOAT', type=click.FloatRange(min=0), default=1, required=False, show_default=True)
-@click.option('--mode', help='autoencoder or eg3d', metavar='STR',  type=click.Choice(['AE', 'EG3D', 'MFIM', 'E_warmup_w+','E_warmup_w++', 'E_warmup_w++_map','AE_new']), required=True, default='AE')
+@click.option('--mode', help='autoencoder or eg3d', metavar='STR',  type=click.Choice(['AE', 'EG3D', 'MFIM', 'E_warmup_w+','E_warmup_w++', 'E_warmup_w++_map','AE_new','AE_Platon']), required=True, default='AE')
 @click.option('--pretrain', help='autoencoder or eg3d', metavar='STR',  type=str,  default=None)
 #@click.option('--loss_selection', type=click.Choice(['vgg','l1','id', 'gan','deca']), multiple=True)
 @click.option('--loss_selection', type=(str,float) , default =[('l1',1),('deca',5)],multiple=True)

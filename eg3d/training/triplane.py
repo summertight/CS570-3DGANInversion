@@ -119,8 +119,8 @@ class TriPlaneGenerator(torch.nn.Module):
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
 
 
-        out_dict = self.neural_render_integrated(planes,ws,ray_origins,ray_directions)
-        out_roll_dict = self.neural_render_integrated(planes,ws,ray_origins_roll,ray_directions_roll)
+        out_dict = self.neural_render_integrated(planes,ws,ray_origins,ray_directions,**synthesis_kwargs)
+        out_roll_dict = self.neural_render_integrated(planes,ws,ray_origins_roll,ray_directions_roll,**synthesis_kwargs)
 
         out_integrated = {'src': out_dict, 'roll': out_roll_dict }
         '''
@@ -151,7 +151,7 @@ class TriPlaneGenerator(torch.nn.Module):
         ray_origins, ray_directions = self.ray_sampler(cam2world_matrix, intrinsics, neural_rendering_resolution)
         return ray_origins, ray_directions
 
-    def neural_render_integrated(self, planes, ws, ray_origins, ray_directions):
+    def neural_render_integrated(self, planes, ws, ray_origins, ray_directions,**synthesis_kwargs):
 
         feature_samples, depth_samples, weights_samples = self.renderer(planes, self.decoder, ray_origins, ray_directions, self.rendering_kwargs) # channels last
         H = W = self.neural_rendering_resolution
