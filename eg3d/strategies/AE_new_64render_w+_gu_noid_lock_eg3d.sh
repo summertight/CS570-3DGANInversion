@@ -9,4 +9,4 @@ python train.py --outdir=/home/nas2_userF/gyojunggu/gyojung/faceswap/eg3d/eg3d/a
 --w_type w+ \
 --mode AE --mbstd-group 2 \
 --lr_g 0.00005 --lr_d 0.00008 --lr_e 0.00005 \
---neural_rendering_resolution_initial 128
+--neural_rendering_resolution_initial 64

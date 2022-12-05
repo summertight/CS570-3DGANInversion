@@ -122,7 +122,7 @@ class TriPlaneGenerator(torch.nn.Module):
         out_dict = self.neural_render_integrated(planes,ws,ray_origins,ray_directions,**synthesis_kwargs)
         out_roll_dict = self.neural_render_integrated(planes,ws,ray_origins_roll,ray_directions_roll,**synthesis_kwargs)
 
-        out_integrated = {'src': out_dict, 'roll': out_roll_dict }
+        out_integrated = {'src': out_dict, 'roll': out_roll_dict}
         '''
         # Perform volume rendering
         feature_samples, depth_samples, weights_samples = self.renderer(planes, self.decoder, ray_origins, ray_directions, self.rendering_kwargs) # channels last
@@ -170,6 +170,9 @@ class TriPlaneGenerator(torch.nn.Module):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
         planes = self.backbone.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
+        #import numpy as np
+        #np.save('triplane_sample',planes.detach().cpu().numpy())
+        #torch.save('triplane_sample')
         return self.renderer.run_model(planes, self.decoder, coordinates, directions, self.rendering_kwargs)
 
     def sample_mixed(self, coordinates, directions, ws, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):

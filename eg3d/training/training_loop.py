@@ -222,20 +222,26 @@ def training_loop(
     
 
     # Resume from existing pickle.
-    if (resume_pkl is not None) and (rank == 0):
-    #if True:
+    #if (resume_pkl is not None) and (rank == 0):
+    if True:
+        resume_pkl='/home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl'
         print(f'Resuming from "{resume_pkl}"')
-        ep ='/home/nas4_user/jaeseonglee/ICCV2023/eg3d/eg3d/training-runs-ae_new_128_w+_1129/00010-ffhq-FFHQ_png_512-gpus2-batch8-gamma1/E-snapshot-000000.pth'
-        gp ='/home/nas4_user/jaeseonglee/ICCV2023/eg3d/eg3d/training-runs-ae_new_128_w+_1129/00010-ffhq-FFHQ_png_512-gpus2-batch8-gamma1/G-snapshot-000000.pth'
-        dp =None
+        ep ='/home/nas2_userF/gyojunggu/gyojung/faceswap/eg3d/eg3d/ae_new_128_w+_1202_noid_lock_eg3d/00003-ffhq-FFHQ_png_512-gpus3-batch12-gamma1/E-snapshot-000501.pth'
+        gp = ep.replace('E-snap','G-snap')
+        #dp = ep.replace('E-snap','D-snap')
 
         E_ckpt = torch.load(ep)
-        G_ckpt = torch.load(gp)
-        D_ckpt = torch.load(dp)
+        #G_ckpt = torch.load(gp)
+        #D_ckpt = torch.load(dp)
 
         E.load_state_dict(E_ckpt)
-        G.load_state_dict(G_ckpt)
-        D.load_state_dict(D_ckpt)
+        #G.load_state_dict(G_ckpt)
+        with dnnlib.util.open_url(resume_pkl) as f:
+            pretrained_data = legacy.load_network_pkl(f)
+        misc.copy_params_and_buffers(pretrained_data['G_ema'], G, require_all=False)
+        # Load pre-trained Discriminator
+        misc.copy_params_and_buffers(pretrained_data['D'], D, require_all=False)
+        #D.load_state_dict(D_ckpt)
 
         '''
         with dnnlib.util.open_url(resume_pkl) as f:
@@ -421,7 +427,7 @@ def training_loop(
                 all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 
         # Execute training phases.
-        if mode == 'AE'or mode=='AE_new' or mode=='AE_Platon':
+        if mode == 'AE' or mode=='AE_new' or mode=='AE_Platon':
 
             for phase in phases:
 
@@ -466,6 +472,9 @@ def training_loop(
                         for param, grad in zip(params, grads):
                             param.grad = grad.reshape(param.shape)
                     phase.opt.step()
+                    #if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
+                    #    if mode=='AE':
+                    #        print('Scheduler step!')
 
                 # Phase done.
                 if phase.end_event is not None:
@@ -496,7 +505,9 @@ def training_loop(
             if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
             #if False:
                 if rank==0:
-                    print(cur_nimg, " : cur_nimg")
+                    if cur_nimg%1000 == 0:
+                        print(cur_nimg, " : cur_nimg")
+                    #print(mode)
                 continue
 
             # Print status line, accumulating the same information in training_stats.
@@ -532,7 +543,7 @@ def training_loop(
 
                     images = torch.cat((real_img_save['image_src'], gen_img_save['src']['image'].detach(), gen_img_save['roll']['image'].detach()), 0).cpu().numpy()
                     images_depth = torch.cat((gen_img_save['src']['image_depth'].detach(),gen_img_save['roll']['image_depth'].detach()),0).cpu().numpy()
-
+                    #print(images.shape, images_depth.shape)
                     save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=(int(batch_size/num_gpus),3))
                     save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth.png'), drange=[images_depth.min(), images_depth.max()], grid_size=(int(batch_size/num_gpus),2))
                
@@ -583,6 +594,8 @@ def training_loop(
 
                     print('***'*10)
                     print('pickle dumpped!')
+                    print(f'cur tick: {cur_tick}')
+                    print(f'cur nimg: {cur_nimg}')
                     print('***'*10)
 
                     #with open(snapshot_pkl, 'wb') as f:
