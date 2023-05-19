@@ -49,7 +49,7 @@ def main(args):
         name = testdata[i]['imagename']
         images = testdata[i]['image'].to(device)[None,...]
         with torch.no_grad():
-            import pdb;pdb.set_trace()
+            #import pdb;pdb.set_trace()
             codedict = deca.encode(images)
             opdict, visdict = deca.decode(codedict) #tensor
             if args.render_orig:

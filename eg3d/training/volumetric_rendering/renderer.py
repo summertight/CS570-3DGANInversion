@@ -159,6 +159,82 @@ class ImportanceRenderer(torch.nn.Module):
 
         return rgb_final, depth_final, weights.sum(2)
 
+    def forward_cross(self, planes_c, planes_d, decoder, ray_origins, ray_directions, rendering_options):
+        self.plane_axes = self.plane_axes.to(ray_origins.device)
+
+        if rendering_options['ray_start'] == rendering_options['ray_end'] == 'auto':
+            ray_start, ray_end = math_utils.get_ray_limits_box(ray_origins, ray_directions, box_side_length=rendering_options['box_warp'])
+            is_ray_valid = ray_end > ray_start
+            if torch.any(is_ray_valid).item():
+                ray_start[~is_ray_valid] = ray_start[is_ray_valid].min()
+                ray_end[~is_ray_valid] = ray_start[is_ray_valid].max()
+            depths_coarse = self.sample_stratified(ray_origins, ray_start, ray_end, rendering_options['depth_resolution'], rendering_options['disparity_space_sampling'])
+        else:
+            # Create stratified depth samples
+            depths_coarse = self.sample_stratified(ray_origins, rendering_options['ray_start'], rendering_options['ray_end'], rendering_options['depth_resolution'], rendering_options['disparity_space_sampling'])
+
+        batch_size, num_rays, samples_per_ray, _ = depths_coarse.shape
+
+        # Coarse Pass
+        sample_coordinates = (ray_origins.unsqueeze(-2) + depths_coarse * ray_directions.unsqueeze(-2)).reshape(batch_size, -1, 3)
+        sample_directions = ray_directions.unsqueeze(-2).expand(-1, -1, samples_per_ray, -1).reshape(batch_size, -1, 3)
+
+
+        out_c = self.run_model(planes_c, decoder, sample_coordinates, sample_directions, rendering_options)
+        out_d = self.run_model(planes_d, decoder, sample_coordinates, sample_directions, rendering_options)
+        
+        colors_coarse_c = out_c['rgb']
+        densities_coarse_c = out_c['sigma']
+        colors_coarse_c = colors_coarse_c.reshape(batch_size, num_rays, samples_per_ray, colors_coarse_c.shape[-1])
+        densities_coarse_c = densities_coarse_c.reshape(batch_size, num_rays, samples_per_ray, 1)
+
+        colors_coarse_d = out_d['rgb']
+        densities_coarse_d = out_d['sigma']
+        colors_coarse_d = colors_coarse_d.reshape(batch_size, num_rays, samples_per_ray, colors_coarse_d.shape[-1])
+        densities_coarse_d = densities_coarse_d.reshape(batch_size, num_rays, samples_per_ray, 1)
+
+        #colors_coarse = colors_coarse.reshape(batch_size, num_rays, samples_per_ray, colors_coarse.shape[-1])
+        #densities_coarse = densities_coarse.reshape(batch_size, num_rays, samples_per_ray, 1)
+
+        # Fine Pass
+        N_importance = rendering_options['depth_resolution_importance']
+        if N_importance > 0:
+            _, _, weights_d = self.ray_marcher(colors_coarse_d, densities_coarse_d, depths_coarse, rendering_options)
+            _, _, weights_c = self.ray_marcher(colors_coarse_c, densities_coarse_c, depths_coarse, rendering_options)
+
+            depths_fine_d = self.sample_importance(depths_coarse, weights_d, N_importance)
+            depths_fine_c = self.sample_importance(depths_coarse, weights_c, N_importance)
+
+            sample_directions = ray_directions.unsqueeze(-2).expand(-1, -1, N_importance, -1).reshape(batch_size, -1, 3)
+            sample_coordinates_d = (ray_origins.unsqueeze(-2) + depths_fine_d * ray_directions.unsqueeze(-2)).reshape(batch_size, -1, 3)
+            sample_coordinates_c = (ray_origins.unsqueeze(-2) + depths_fine_c * ray_directions.unsqueeze(-2)).reshape(batch_size, -1, 3)
+
+            out_c = self.run_model(planes_c, decoder, sample_coordinates_c, sample_directions, rendering_options)
+            out_d = self.run_model(planes_d, decoder, sample_coordinates_d, sample_directions, rendering_options)
+            
+            colors_fine_c = out_c['rgb']
+            densities_fine_c = out_c['sigma']
+            colors_fine_d = out_d['rgb']
+            densities_fine_d = out_d['sigma']
+
+            colors_fine_c = colors_fine_c.reshape(batch_size, num_rays, N_importance, colors_fine_c.shape[-1])
+            densities_fine_c = densities_fine_c.reshape(batch_size, num_rays, N_importance, 1)
+            colors_fine_d = colors_fine_d.reshape(batch_size, num_rays, N_importance, colors_fine_d.shape[-1])
+            densities_fine_d = densities_fine_d.reshape(batch_size, num_rays, N_importance, 1)
+
+            all_depths_c, all_colors_c, all_densities_c = self.unify_samples(depths_coarse, colors_coarse_c, densities_coarse_c,
+                                                                  depths_fine_c, colors_fine_c, densities_fine_c)
+            all_depths_d, all_colors_d, all_densities_d = self.unify_samples(depths_coarse, colors_coarse_d, densities_coarse_d,
+                                                                  depths_fine_d, colors_fine_d, densities_fine_d)
+
+            # Aggregate
+            rgb_final, depth_final, weights = self.ray_marcher(all_colors_d, all_densities_d, all_depths_d, rendering_options)
+        else:
+            rgb_final, depth_final, weights = self.ray_marcher(colors_coarse, densities_coarse, depths_coarse, rendering_options)
+
+
+        return rgb_final, depth_final, weights.sum(2)
+
     def run_model(self, planes, decoder, sample_coordinates, sample_directions, options):
         sampled_features = sample_from_planes(self.plane_axes, planes, sample_coordinates, padding_mode='zeros', box_warp=options['box_warp'])
 

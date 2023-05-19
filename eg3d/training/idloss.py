@@ -14,25 +14,39 @@ class IDLoss(nn.Module):
         self.facenet.eval()
 
     def extract_feats(self, x):
-        x = x[:, :, 35:223, 32:220]  # Crop interesting region
+        #t = 35 - 18
+        #b = 223 + 18
+        #l = 32 - 18
+        #r = 220 + 18
+
+        #x = x[:, :, t:b, l:r] # Crop interesting region
         x = self.face_pool(x)
         x_feats = self.facenet(x)
+
         return x_feats
 
-    def forward(self, x, y,):
-        #n_samples = y.shape[0]
-        #import pdb;pdb.set_trace()
+    def forward(self, x, y):
         y_feats = self.extract_feats(y)  # Otherwise use the feature from there
         x_feats = self.extract_feats(x)
-        y_feats = y_feats.detach()
-        #loss = 0
-     
-        #count = 0
-        #for i in range(n_samples):
-        #    diff_target = x_feats[i].dot(y_feats[i])
-        #    loss += 1 - diff_target
-        #    count += 1
+        #print(y_feats.shape, x_feats.shape, 'dasd')
+        #y_feats = y_feats.detach()
+    
 
-        loss = loss = (1 - torch.cosine_similarity(x_feats, y_feats))
+        loss = (1 - torch.cosine_similarity(x_feats, y_feats)).mean()
+
+        return loss 
+
+    def forward_contrastive(self, src, tgt, rec):
+        src_feats = self.extract_feats(src)  # Otherwise use the feature from there
+        tgt_feats = self.extract_feats(tgt)
+
+        rec_feats = self.extract_feats(rec)
+
+        loss = (torch.cosine_similarity(rec_feats, tgt_feats) - torch.cosine_similarity(src_feats, tgt_feats))**2
+        #print(y_feats.shape, x_feats.shape, 'dasd')
+        #y_feats = y_feats.detach()
+    
+
+        
 
         return loss 

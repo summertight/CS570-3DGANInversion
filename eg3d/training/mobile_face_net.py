@@ -257,6 +257,7 @@ class MobileFaceNet(Module):
         size = x.size(2)
         x = F.interpolate(x, size=(112, 112), mode="bilinear")
         landmark = self.forward(x)[0]
+        #print(landmark.max())
         landmark = landmark * size
         landmark = landmark.view(landmark.size(0), -1, 2)  # N x 68 x 2
 
@@ -281,13 +282,15 @@ class MobileFaceNet(Module):
         )
 
         # Get left, right, top, bottom
+        #breakpoint()
         l = lm[:, :, 0].min(dim=1, keepdim=True)[0]
         r = lm[:, :, 0].max(dim=1, keepdim=True)[0]
         t = lm[:, :, 1].min(dim=1, keepdim=True)[0]
         b = lm[:, :, 1].max(dim=1, keepdim=True)[0]
 
         # Calcualte new img size with margin
-        old_size = (r - l + b - t) / 2 * 1.1
+        old_size = (r - l + b - t) / 2 #* 1.1
+        #print('dnon')
         new_size = old_size * scale
 
         # Calculate center

@@ -114,7 +114,7 @@ def init_dataset_kwargs(data, mode):
         raise click.ClickException(f'--data: {err}')
 #----------------------------------------------------------------------------
 @click.command()
-@click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
+@click.option('--network', 'network_pkl', help='Network pickle filename', required=False)
 @click.option('--seeds', type=parse_range, help='List of random seeds (e.g., \'0,1,4-6\')', required=True)
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1, show_default=True)
 @click.option('--trunc-cutoff', 'truncation_cutoff', type=int, help='Truncation cutoff', default=14, show_default=True)
@@ -152,17 +152,18 @@ def generate_images(
     device = torch.device('cuda')
     
 
-    E_path = '/home/nas2_userF/gyojunggu/gyojung/faceswap/eg3d/eg3d/ae_new_128_w+_1129/00007-ffhq-FFHQ_png_512-gpus2-batch4-gamma1/E-snapshot-000100.pth'
-    G_path = '/home/nas2_userF/gyojunggu/gyojung/faceswap/eg3d/eg3d/ae_new_128_w+_1129/00007-ffhq-FFHQ_png_512-gpus2-batch4-gamma1/G-snapshot-000100.pth'
+    E_path = '/home/nas4_user/jaeseonglee/ICCV2023/eg3d/eg3d/pSp_128_wreg_except_raw_start_from_avg/00008-ffhq-FFHQ_png_512-gpus5-batch10-gamma1/E-snapshot-000900.pth'
+    G_path = '/home/nas4_user/jaeseonglee/ICCV2023/eg3d/eg3d/pSp_128_wreg_except_raw_start_from_avg/00008-ffhq-FFHQ_png_512-gpus5-batch10-gamma1/G-snapshot-000900.pth'
     E_ckpt = torch.load(E_path)
     G_ckpt = torch.load(G_path)
-    train_opt_path = '/home/nas2_userF/gyojunggu/gyojung/faceswap/eg3d/eg3d/ae_new_128_w+_1129/00007-ffhq-FFHQ_png_512-gpus2-batch4-gamma1/training_options.json'
+    train_opt_path = '/home/nas4_user/jaeseonglee/ICCV2023/eg3d/eg3d/pSp_128_wreg_except_raw_start_from_avg/00008-ffhq-FFHQ_png_512-gpus5-batch10-gamma1/training_options.json'
     with open(train_opt_path) as js:
         opt_json = json.load(js)
     common_kwargs = dict(c_dim=25, img_resolution=512, img_channels=96)
     #breakpoint()
     del G_ckpt['dataset_label_std']
     G = dnnlib.util.construct_class_by_name(**opt_json['G_kwargs'], **common_kwargs).eval().requires_grad_(False).to(device) # subclass of torch.nn.Module
+    G.neural_rendering_resolution = 128
     G.load_state_dict(G_ckpt)
     import sys
     sys.path.append('./training/pixel2style2pixel')
@@ -208,8 +209,19 @@ def generate_images(
     from torch_utils.ops import upfirdn2d
     from training.dual_discriminator import filtered_resizing
     # Generate images.
-    for seed_idx, seed in enumerate(seeds):
-        print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
+    ws_avg = G.backbone.mapping.w_avg.unsqueeze(0).unsqueeze(1).detach().cpu().numpy()
+    np.save(f'{outdir}/w_avg',ws_avg)
+    data_path = '/home/nas4_user/jaeseonglee/ICCV2023/eg3d/eg3d'
+    with open(os.path.join(data_path, 'inthewild_data' ,'dataset.json')) as f:
+        label = json.load(f)['labels']
+    datum = 'candal.png'
+    label = dict(label)
+    c = label[datum]
+    c = torch.from_numpy(np.array(c)).to(torch.float32).to(device).unsqueeze(0)
+    
+    #for seed_idx, seed in enumerate(seeds):
+    if True:
+        #print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
         #z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
         real_img, real_c = next(training_set_iterator)
         real_img = (real_img.to(device).to(torch.float32) / 127.5 - 1)
@@ -217,10 +229,19 @@ def generate_images(
         resample_filter = upfirdn2d.setup_filter([1,3,3,1], device=device)
         
         real_img= filtered_resizing(real_img, size=256, f=resample_filter, filter_mode='antialiased')
+        
         real_c = real_c.to(device)
+
+        img_path  = os.path.join(data_path,'inthewild_data', datum)
+        img = PIL.Image.open(img_path).resize((256,256), PIL.Image.LANCZOS)
+        img = torch.from_numpy(np.array(img).transpose(2,0,1))
+        real_img = (img.to(device).to(torch.float32) / 127.5 - 1).unsqueeze(0)
+
         imgs = []
         angle_p = -0.2
         ws = E(real_img)
+
+         
         for angle_y, angle_p in [(1.2, angle_p), (0, angle_p), (-1.2, angle_p)]:
             cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
             cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
@@ -228,10 +249,6 @@ def generate_images(
             conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device)
             camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
             conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
-
-            #ws = G.mapping(z, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-            #import pdb;pdb.set_trace()
-            
             img = G.synthesis(ws, None, camera_params)['image']
 
             img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
@@ -239,7 +256,8 @@ def generate_images(
 
         img = torch.cat(imgs, dim=2)
 
-        PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
+        PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed_{datum}.png')
+        #np.save(f'{outdir}/seed{seed:04d}',ws.cpu().detach().numpy())
 
         if shapes:
             # extract a shape.mrc with marching cubes. You can view the .mrc file using ChimeraX from UCSF.
@@ -263,7 +281,7 @@ def generate_images(
                         pbar.update(max_batch)
 
             sigmas = sigmas.reshape((shape_res, shape_res, shape_res)).cpu().numpy()
-            breakpoint()
+            #breakpoint()
             sigmas = np.flip(sigmas, 0)
 
             # Trim the border of the extracted cube

@@ -140,7 +140,7 @@ def create_samples(N=256, voxel_origin=[0, 0, 0], cube_length=2.0):
 @click.option('--lr', help='lr', type=float, default=1e-2)
 @click.option('--steps', help='steps', type=int, default=5001)
 @click.option('--w_type', help='Select W type', type=click.Choice(['w','w+']), default='w+')
-@click.option('--invert_map', help='also invert map?', type=bool, default=True)
+@click.option('--invert_map', help='also invert map?', type=bool, default=False)
 
 #XXX data_path: /home/nas1_userB/dataset/ffhq-dataset/images1024x1024/images1024x1024_refined/
 #XXX python gen_inversion.py --outdir=out_inversion_l1 --trunc=0.7 --seeds=0-3 --network=/home/nas4_user/jaeseonglee/CVPR2023/ckpts/pretrained_eg3d_ffhq256_025000.pkl --data_path /home/nas1_userB/dataset/ffhq-dataset/images1024x1024/images1024x1024_refined
@@ -205,7 +205,7 @@ def generate_images(
 
     image_path_list = [os.path.join(data_path,i) for i in os.listdir(data_path)]
     import json
-    with open(os.path.join(data_path,'dataset_integrated_spherical.json')) as f:
+    with open(os.path.join(data_path,'dataset.json')) as f:
         labels = json.load(f)['labels']
     resample_filter = upfirdn2d.setup_filter([1,3,3,1], device=device)
     labels = dict(labels)
@@ -216,10 +216,11 @@ def generate_images(
         np.random.seed(seed)
         print('Inversion for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
         #z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
-        pivot_key = 'mirror.png'
-        while pivot_key.split('_')[-1] == 'mirror.png':
-            pivot_key = np.random.choice(list(labels.keys()))
-        
+        # pivot_key = 'mirror.png'
+        # while pivot_key.split('_')[-1] == 'mirror.png':
+        #     pivot_key = np.random.choice(list(labels.keys()))
+        pivot_key = 'axel.png'
+        #import pdb;pdb.set_trace()
         c = labels[pivot_key]
         c = torch.from_numpy(np.array(c)).to(torch.float32).to(device).unsqueeze(0)
         
@@ -270,29 +271,17 @@ def generate_images(
         intrinsics = FOV_to_intrinsics(18.837, device=device)
         #ws = G.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
         for step in range(steps):
-            #ws = w.unsqueeze(1).repeat(1,14,1)
-
-            #import pdb;pdb.set_trace()
+        
             
-            if invert_map:
-                img_rec = G.synthesis(w, maps, c)['image']
-            else:
-                img_rec = G.synthesis(w, c=c)['image']
-                
-                #import pdb;pdb.set_trace()
-                #img_rec = imgs['image']
+        
            
             if w_type == 'w':
-                img_rec = G.synthesis(w.repeat(1,14,1), c)['image']
+                img_rec = G.synthesis(w.repeat(1,14,1), c=c)['image']
             elif w_type == 'w+':
 
-                result = G.synthesis(w,c)['image']
+                img_rec = G.synthesis(w,c=c)['image']
                 #import pdb;pdb.set_trace()
-                img = result['image']
-                #img_rec_raw =
-                if 'raw' in loss_to:
-                    img_rec_raw = result['image_raw']
-                    img_raw = filtered_resizing(img, size=128, f=resample_filter, filter_mode='antialiased')
+                
 
             #import pdb;pdb.set_trace()
             loss = 0
@@ -300,9 +289,7 @@ def generate_images(
             if 'full' in loss_to:
                 loss_l1 = torch.nn.functional.l1_loss(img_rec, img).mean()
                 loss = loss + loss_l1
-            if 'raw' in loss_to:
-                loss_l1_raw = torch.nn.functional.l1_loss(img_rec_raw, img_raw).mean()
-                loss = loss + loss_l1_raw
+    
             if 'vgg' in loss_choice:
                 #import pdb;pdb.set_trace()
                 img_rec_mini = torch.nn.functional.interpolate(img_rec,size=(256,256))
@@ -311,17 +298,13 @@ def generate_images(
                     
                     loss_vgg = 1 * criterion_VGG(img_rec_mini, img_mini).mean()
                     loss = loss + loss_vgg
-                if 'raw' in loss_to:
-                    loss_vgg_raw = 1e-2 * criterion_VGG(img_rec_raw, img_mini).mean()
-                    loss = loss + loss_vgg_raw
+       
             if 'id' in loss_choice:
                 #import pdb;pdb.set_trace()
                 if 'full' in loss_to:
                     loss_id = criterion_ID(img, img_rec).mean()
                     loss = loss + loss_id
-                if 'raw' in loss_to:
-                    loss_id_raw = criterion_ID(img, img_rec_raw).mean()
-                    loss = loss + loss_id_raw
+
 
             if step%100==0:
                 #if 'vgg' in loss_choice:

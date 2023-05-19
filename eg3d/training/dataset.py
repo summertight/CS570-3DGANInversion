@@ -33,13 +33,16 @@ class Dataset(torch.utils.data.Dataset):
         use_labels  = False,    # Enable conditioning labels? False = label dimension is zero.
         xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
         random_seed = 0,        # Random seed to use when applying max_size.
+        mode = None,
+        n_of_data = -1,
     ):
         self._name = name
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
         self._raw_labels = None
         self._label_shape = None
-
+        self.mode = mode
+        self._n_of_data = n_of_data
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
         if (max_size is not None) and (self._raw_idx.size > max_size):
@@ -88,14 +91,41 @@ class Dataset(torch.utils.data.Dataset):
         return self._raw_idx.size
 
     def __getitem__(self, idx):
-        image = self._load_raw_image(self._raw_idx[idx])
-        assert isinstance(image, np.ndarray)
-        assert list(image.shape) == self.image_shape
-        assert image.dtype == np.uint8
-        if self._xflip[idx]:
-            assert image.ndim == 3 # CHW
-            image = image[:, :, ::-1]
-        return image.copy(), self.get_label(idx)
+        if self.mode == 'Swap_LIA' or self.mode == 'Swap_LIA_warmup' or self.mode=='MFIM_nomaps_warmup' or self.mode=='MFIM':
+            
+            image_src = self._load_raw_image(self._raw_idx[np.random.choice(self._raw_idx)])
+            image_tgt = self._load_raw_image(self._raw_idx[idx])
+            
+            assert isinstance(image_src, np.ndarray)
+            assert list(image_src.shape) == self.image_shape
+            assert image_src.dtype == np.uint8
+            if self._xflip[idx]:
+                assert image_src.ndim == 3 # CHW
+                image_src = image_src[:, :, ::-1]
+                image_tgt = image_tgt[:, :, ::-1]
+
+            return image_src.copy(), image_tgt.copy(), self.get_label(idx)
+        
+        elif self.mode == 'single_id' or self.mode=='opt':
+
+            image, mask, ldmk = self._load_raw_image(self._raw_idx[idx],mode='train')
+            
+            assert isinstance(image, np.ndarray)
+            assert list(image.shape) == self.image_shape
+            assert image.dtype == np.uint8
+            
+                
+
+            return image.copy(), mask.copy(), ldmk.copy(), self.get_label(idx)
+        else:
+            image = self._load_raw_image(self._raw_idx[idx])
+            assert isinstance(image, np.ndarray)
+            assert list(image.shape) == self.image_shape
+            assert image.dtype == np.uint8
+            if self._xflip[idx]:
+                assert image.ndim == 3 # CHW
+                image = image[:, :, ::-1]
+            return image.copy(), self.get_label(idx)
 
     def get_label(self, idx):
         label = self._get_raw_labels()[self._raw_idx[idx]]
@@ -167,6 +197,7 @@ class ImageFolderDataset(Dataset):
     ):
         self._path = path
         self._zipfile = None
+        #self.n_of_data = n_of_data
 
         if os.path.isdir(self._path):
             self._type = 'dir'
@@ -179,6 +210,8 @@ class ImageFolderDataset(Dataset):
 
         PIL.Image.init()
         self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in PIL.Image.EXTENSION)
+        
+        self._image_fnames = self._image_fnames[:100]
         if len(self._image_fnames) == 0:
             raise IOError('No image files found in the specified path')
 
@@ -215,7 +248,7 @@ class ImageFolderDataset(Dataset):
     def __getstate__(self):
         return dict(super().__getstate__(), _zipfile=None)
 
-    def _load_raw_image(self, raw_idx):
+    def _load_raw_image(self, raw_idx, mode='test'):
         fname = self._image_fnames[raw_idx]
         with self._open_file(fname) as f:
             if pyspng is not None and self._file_ext(fname) == '.png':
@@ -226,6 +259,12 @@ class ImageFolderDataset(Dataset):
         if image.ndim == 2:
             image = image[:, :, np.newaxis] # HW => HWC
         image = image.transpose(2, 0, 1) # HWC => CHW
+        
+        if mode=='train':
+            img_path = os.path.join(self._path, fname)
+            mask = np.array(PIL.Image.open(img_path.replace('crop','crop_msks')))[...,None].transpose(2,0,1)
+            ldmk = np.load(img_path.replace('crop','crop_kps').replace('.png','.png.npy'), allow_pickle=True)
+            return image, mask, ldmk
         return image
 
     def _load_raw_labels(self):

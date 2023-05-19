@@ -44,6 +44,7 @@ class TriPlaneGenerator(torch.nn.Module):
         self.rendering_kwargs = rendering_kwargs
     
         self._last_planes = None
+        self.w_avg = None
     
     def mapping(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False):
         if self.rendering_kwargs['c_gen_conditioning_zero']:
@@ -85,6 +86,84 @@ class TriPlaneGenerator(torch.nn.Module):
         # Run superresolution to get final image
         rgb_image = feature_image[:, :3]
         sr_image = self.superresolution(rgb_image, feature_image, ws, noise_mode=self.rendering_kwargs['superresolution_noise_mode'], **{k:synthesis_kwargs[k] for k in synthesis_kwargs.keys() if k != 'noise_mode'})
+
+        return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}
+    
+    def synthesis_extract_feat(self, ws, maps=None, c=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
+        cam2world_matrix = c[:, :16].view(-1, 4, 4)
+        intrinsics = c[:, 16:25].view(-1, 3, 3)
+
+        if neural_rendering_resolution is None:
+            neural_rendering_resolution = self.neural_rendering_resolution
+        else:
+            self.neural_rendering_resolution = neural_rendering_resolution
+
+        # Create a batch of rays for volume rendering
+        ray_origins, ray_directions = self.ray_sampler(cam2world_matrix, intrinsics, neural_rendering_resolution)
+
+        # Create triplanes by running StyleGAN backbone
+        N, M, _ = ray_origins.shape
+        if use_cached_backbone and self._last_planes is not None:
+            planes = self._last_planes
+        else:
+            planes, feat_list = self.backbone.synthesis(ws, maps, update_emas=update_emas, return_feat=True, **synthesis_kwargs)
+        if cache_backbone:
+            self._last_planes = planes
+
+        # Reshape output into three 32-channel planes
+        planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
+
+        # Perform volume rendering
+        feature_samples, depth_samples, weights_samples = self.renderer(planes, self.decoder, ray_origins, ray_directions, self.rendering_kwargs) # channels last
+
+        # Reshape into 'raw' neural-rendered image
+        H = W = self.neural_rendering_resolution
+        feature_image = feature_samples.permute(0, 2, 1).reshape(N, feature_samples.shape[-1], H, W).contiguous()
+        depth_image = depth_samples.permute(0, 2, 1).reshape(N, 1, H, W)
+
+        # Run superresolution to get final image
+        rgb_image = feature_image[:, :3]
+        sr_image = self.superresolution(rgb_image, feature_image, ws, noise_mode=self.rendering_kwargs['superresolution_noise_mode'], **{k:synthesis_kwargs[k] for k in synthesis_kwargs.keys() if k != 'noise_mode'})
+
+        return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}, feat_list
+    
+    def synthesis_cross(self, ws_c, ws_d, maps=None, c=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
+        cam2world_matrix = c[:, :16].view(-1, 4, 4)
+        intrinsics = c[:, 16:25].view(-1, 3, 3)
+
+        if neural_rendering_resolution is None:
+            neural_rendering_resolution = self.neural_rendering_resolution
+        else:
+            self.neural_rendering_resolution = neural_rendering_resolution
+
+        # Create a batch of rays for volume rendering
+        ray_origins, ray_directions = self.ray_sampler(cam2world_matrix, intrinsics, neural_rendering_resolution)
+
+        # Create triplanes by running StyleGAN backbone
+        N, M, _ = ray_origins.shape
+        if use_cached_backbone and self._last_planes is not None:
+            planes = self._last_planes
+        else:
+            planes_c = self.backbone.synthesis(ws_c, maps, update_emas=update_emas, **synthesis_kwargs)
+            planes_d = self.backbone.synthesis(ws_d, maps, update_emas=update_emas, **synthesis_kwargs)
+        
+        if cache_backbone:
+            self._last_planes = planes
+
+        # Reshape output into three 32-channel planes
+        planes_c = planes_c.view(len(planes_c), 3, 32, planes_c.shape[-2], planes_c.shape[-1])
+        planes_d = planes_d.view(len(planes_d), 3, 32, planes_d.shape[-2], planes_d.shape[-1])
+        # Perform volume rendering
+        feature_samples, depth_samples, weights_samples = self.renderer.forward_cross(planes_c, planes_d, self.decoder, ray_origins, ray_directions, self.rendering_kwargs) # channels last
+
+        # Reshape into 'raw' neural-rendered image
+        H = W = self.neural_rendering_resolution
+        feature_image = feature_samples.permute(0, 2, 1).reshape(N, feature_samples.shape[-1], H, W).contiguous()
+        depth_image = depth_samples.permute(0, 2, 1).reshape(N, 1, H, W)
+
+        # Run superresolution to get final image
+        rgb_image = feature_image[:, :3]
+        sr_image = self.superresolution(rgb_image, feature_image, ws_c, noise_mode=self.rendering_kwargs['superresolution_noise_mode'], **{k:synthesis_kwargs[k] for k in synthesis_kwargs.keys() if k != 'noise_mode'})
 
         return {'image': sr_image, 'image_raw': rgb_image, 'image_depth': depth_image}
     
@@ -174,7 +253,16 @@ class TriPlaneGenerator(torch.nn.Module):
         #np.save('triplane_sample',planes.detach().cpu().numpy())
         #torch.save('triplane_sample')
         return self.renderer.run_model(planes, self.decoder, coordinates, directions, self.rendering_kwargs)
-
+    def sample_from_ws(self, coordinates, directions, ws, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
+        # Compute RGB features, density for arbitrary 3D coordinates. Mostly used for extracting shapes. 
+        #ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
+        planes = self.backbone.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
+        planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
+        #import numpy as np
+        #np.save('triplane_sample',planes.detach().cpu().numpy())
+        #torch.save('triplane_sample')
+        return self.renderer.run_model(planes, self.decoder, coordinates, directions, self.rendering_kwargs)
+  
     def sample_mixed(self, coordinates, directions, ws, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
         # Same as sample, but expects latent vectors 'ws' instead of Gaussian noise 'z'
         planes = self.backbone.synthesis(ws, update_emas = update_emas, **synthesis_kwargs)

@@ -145,7 +145,9 @@ class Conv2dLayer(torch.nn.Module):
         conv_clamp      = None,         # Clamp the output to +-X, None = disable clamping.
         channels_last   = False,        # Expect the input to have memory_format=channels_last?
         trainable       = True,         # Update the weights of this layer during training?
+        padding         = None
     ):
+
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -154,7 +156,7 @@ class Conv2dLayer(torch.nn.Module):
         self.down = down
         self.conv_clamp = conv_clamp
         self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
-        self.padding = kernel_size // 2
+        self.padding = padding if padding is not None else kernel_size // 2
         self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
         self.act_gain = bias_act.activation_funcs[activation].def_gain
 
@@ -327,7 +329,7 @@ class SynthesisLayer(torch.nn.Module):
       
         #print()
         flip_weight = (self.up == 1) # slightly faster
-        #print(x.shape, 'x.shape')
+        
         x = modulated_conv2d(x=x, weight=self.weight, styles=styles, noise=noise, up=self.up,
             padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv)
 
@@ -526,7 +528,7 @@ class SynthesisNetwork(torch.nn.Module):
                 self.num_ws += block.num_torgb
             setattr(self, f'b{res}', block)
 
-    def forward(self, ws, maps = None,  **block_kwargs):
+    def forward(self, ws, maps = None, return_feat=False, **block_kwargs):
         block_ws = []
         
         with torch.autograd.profiler.record_function('split_ws'):
@@ -561,6 +563,8 @@ class SynthesisNetwork(torch.nn.Module):
         
 
         x = img = None  
+        if return_feat:
+            feat_list = []
         if maps is not None:
             map_iter = iter(maps)
             for res, cur_ws in zip(self.block_resolutions, block_ws):
@@ -579,6 +583,10 @@ class SynthesisNetwork(torch.nn.Module):
             for res, cur_ws in zip(self.block_resolutions, block_ws):
                 block = getattr(self, f'b{res}')
                 x, img = block(x, img, cur_ws, **block_kwargs)
+                if return_feat:
+                    feat_list.append(x)
+            if return_feat:
+                return img, feat_list
             #import pdb;pdb.set_trace()
         return img
 

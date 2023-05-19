@@ -34,6 +34,9 @@ from training.vggloss import VGGLoss
 from training.idloss import IDLoss
 from training.dual_discriminator import filtered_resizing
 
+from pytorch3d.transforms import matrix_to_euler_angles as m2e
+from pytorch3d.transforms import euler_angles_to_matrix as e2m
+
 #XXX python gen_samples.py --outdir=out --trunc=0.7 --shapes=true --seeds=0-3 --network=/home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/ffhq512-128.pkl
 
 
@@ -124,12 +127,12 @@ def create_samples(N=256, voxel_origin=[0, 0, 0], cube_length=2.0):
 #----------------------------------------------------------------------------
 
 @click.command()
-@click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
-@click.option('--seeds', type=parse_range, help='List of random seeds (e.g., \'0,1,4-6\')', required=True)
+@click.option('--network', 'network_pkl', help='Network pickle filename', default='/home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl')
+#@click.option('--seeds', type=parse_range, help='List of random seeds (e.g., \'0,1,4-6\')', required=True)
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1, show_default=True)
 @click.option('--trunc-cutoff', 'truncation_cutoff', type=int, help='Truncation cutoff', default=14, show_default=True)
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
-@click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR', default = './out_chan_mino')
+@click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR', default = './May_inversion')
 @click.option('--shapes', help='Export shapes as .mrc files viewable in ChimeraX', type=bool, required=False, metavar='BOOL', default=False, show_default=True)
 @click.option('--shape-res', help='', type=int, required=False, metavar='int', default=512, show_default=True)
 @click.option('--fov-deg', help='Field of View of camera in degrees', type=int, required=False, metavar='float', default=18.837, show_default=True)
@@ -138,18 +141,17 @@ def create_samples(N=256, voxel_origin=[0, 0, 0], cube_length=2.0):
 @click.option('--data_path', help='data path for paired smthng', type=str, required=True, default=None)
 @click.option('--loss_choice', help='Select Losses', type=click.Choice(['l1', 'vgg', 'id']), default=['l1','vgg'],multiple=True)
 @click.option('--loss_to', help='Select Losses', type=click.Choice(['raw','full']),default = ['full'], multiple=True)
-@click.option('--lr', help='lr', type=float, default=1e-2)
+@click.option('--lr', help='lr', type=float, default=1e-3)
 @click.option('--steps', help='steps', type=int, default=10001)
-@click.option('--w_type', help='Select W type', type=click.Choice(['w','w+','w++']), default='w++')
+@click.option('--w_type', help='Select W type', type=click.Choice(['w','w+','w++']), default='w+')
 @click.option('--invert_map', help='also invert map?', type=bool, default=False)
-
+@click.option('--opt_cam',type=bool, default=False)
 #XXX data_path: /home/nas1_userB/dataset/ffhq-dataset/images1024x1024/images1024x1024_refined/
 #XXX python gen_inversion.py --outdir=out_inversion_l1 --trunc=0.7 --seeds=0-3 --network=/home/nas4_user/jaeseonglee/CVPR2023/ckpts/pretrained_eg3d_ffhq256_025000.pkl --data_path /home/nas1_userB/dataset/ffhq-dataset/images1024x1024/images1024x1024_refined
 #XXX python gen_inversion.py --outdir=out_inversion_w_chanpretrain_inthewild --trunc=0.7 --seeds=0-3 --network=/home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/ffhq512-128.pkl --data_path /home/nas4_user/jaeseonglee/ICCV2023/eg3d/eg3d/inthewild_data
 #XXX CUDA_VISIBLE_DEVICES=2 python gen_inversion_in-the-wild.py --w_type w++ --network /home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl --seeds 0-3 --data_path inthewild_data --outdir ./out_inversion_w++&map_fixed_triplane 
 def generate_images(
     network_pkl: str,
-    seeds: List[int],
     truncation_psi: float,
     truncation_cutoff: int,
     outdir: str,
@@ -166,6 +168,7 @@ def generate_images(
     steps: int,
     w_type: str,
     invert_map: bool,
+    opt_cam: bool,
 ):
     """Generate images using pretrained network pickle.
 
@@ -224,8 +227,14 @@ def generate_images(
             path_imgs.append(i)
         
     #import pdb;pdb.set_trace()
+    #predefined_names = ['minho.png','jaeseong2.png','xxx.png','kanye.png']
+    #predefined_names = ['candal.png'] 
     for idx, datum in enumerate(path_imgs):
+        if idx ==1:
+            break
         #np.random.seed(seed)
+        #if datum not in predefined_names:
+        #    continue
         print(f'Inversion for {idx}')
         #z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
         with open(os.path.join(data_path, 'dataset.json')) as f:
@@ -243,6 +252,10 @@ def generate_images(
 
         
         loss = 0
+        if opt_cam:
+            angle_y_opt = torch.zeros(1).to(device)
+            angle_p_opt = torch.zeros(1).to(device)
+            angle_r_opt = torch.zeros(1).to(device)
         if w_type == 'w':
             w = G.backbone.mapping.w_avg.unsqueeze(0).unsqueeze(1).detach().cpu().cuda()
         elif w_type == 'w+':
@@ -262,16 +275,16 @@ def generate_images(
         # XXX # w+ == #n of blocks * 2 XXX XXX #
         # XXX # w++ == #n of blocks * 3 - 1 XXX #
         # XXX XXX XXX XXX XXX XXX XXX XXX XXX #
+        if invert_map:
+            maps_ = [torch.zeros((1,1,4,4)),
+            torch.zeros((1,1,8,8)),torch.zeros((1,1,8,8)),
+            torch.zeros((1,1,16,16)),torch.zeros((1,1,16,16)),
+            torch.zeros((1,1,32,32)),torch.zeros((1,1,32,32)),
+            torch.zeros((1,1,64,64)),torch.zeros((1,1,64,64)),
+            torch.zeros((1,1,128,128)),torch.zeros((1,1,128,128)), 
+            torch.zeros((1,1,256,256)),torch.zeros((1,1,256,256))]
 
-        maps_ = [torch.zeros((1,1,4,4)),
-        torch.zeros((1,1,8,8)),torch.zeros((1,1,8,8)),
-        torch.zeros((1,1,16,16)),torch.zeros((1,1,16,16)),
-        torch.zeros((1,1,32,32)),torch.zeros((1,1,32,32)),
-        torch.zeros((1,1,64,64)),torch.zeros((1,1,64,64)),
-        torch.zeros((1,1,128,128)),torch.zeros((1,1,128,128)), 
-        torch.zeros((1,1,256,256)),torch.zeros((1,1,256,256))]
-
-        maps = [torch.nn.Parameter(torch.zeros_like(map,device=device)) for map in maps_]
+            maps = [torch.nn.Parameter(torch.zeros_like(map,device=device)) for map in maps_]
         
 
         if invert_map:
@@ -282,64 +295,123 @@ def generate_images(
             optm = torch.optim.Adam(
                 [w],#+maps,
                 lr=lr)
-
+        if opt_cam:
+            cam_params=[]
+            cam_params.append(angle_r_opt)
+            cam_params.append(angle_p_opt)
+            cam_params.append(angle_y_opt)
+            angle_r_opt.requires_grad =True
+            angle_p_opt.requires_grad =True
+            print('SEX')
+            angle_y_opt.requires_grad =True
+            optm_c = torch.optim.Adam(cam_params,lr=lr)
 
 
         intrinsics = FOV_to_intrinsics(18.837, device=device)
     
         for step in range(steps):
     
-            if True:
-                
-                if invert_map:
+          
+            if opt_cam and step%100==0 and step<200:
+                for i in range(600):
+                    cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
+                    cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
+                    cam2world_pose = LookAtPoseSampler.sample(np.pi/2 + angle_y_opt, np.pi/2 + angle_p_opt, cam_pivot, radius=cam_radius, device=device)
                     
-                    result = G.synthesis(w, maps, c)
+                    #R = cam2world_pose[...,:3,:3]
+                    
+                    #e = m2e(R,convention=["Z","Y","X"])
+                    #e[...,0] = angle_r_opt
+                    #R_new = e2m(e,convention=["Z","Y","X"])
+                    #cam2world_pose[...,:3,:3] = R_new
+                    #cam2world_pose[]
+                    camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
+                    result = G.synthesis(w, c=camera_params)
                     img_rec = result['image']
-                else:
-                    result = G.synthesis(w, c=c)
-                    img_rec = result['image']
+                    #c = camera_params
+                    loss = 0
+                    loss_vgg=None; loss_id=None; loss_l1=None; loss_vgg_raw=None; loss_id_raw=None; loss_l1_raw=None
+                    if 'full' in loss_to:
+                        loss_l1 = torch.nn.functional.l1_loss(img_rec, img).mean()
+                        loss = loss + loss_l1
+                    
+                    if 'vgg' in loss_choice:
+                        #import pdb;pdb.set_trace()
+                        img_rec_mini = torch.nn.functional.interpolate(img_rec,size=(256,256))
+                        img_mini = torch.nn.functional.interpolate(img,size=(256,256))
+                        
+                            
+                        loss_vgg = 1 * criterion_VGG(img_rec_mini, img_mini).mean()
+                        loss = loss + loss_vgg
+                        
+                    if 'id' in loss_choice:
+                        #import pdb;pdb.set_trace()
+                        
+                        loss_id = criterion_ID(img, img_rec).mean()
+                        loss = loss + loss_id
+                    imgs_save = []
+                    img_save = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+                    img_rec_save = (img_rec.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
                 
-                if 'raw' in loss_to:
-                        img_rec_raw = result['image_raw']
-                        img_raw = filtered_resizing(img, size=128, f=resample_filter, filter_mode='antialiased')
+                    imgs_save.append(img_save); imgs_save.append(img_rec_save)
+                    imgs_save_file = torch.cat(imgs_save, dim=2)
+              
+                    PIL.Image.fromarray(imgs_save_file[0].cpu().numpy(), 'RGB').save(f'{outdir}/{datum}_{step}_{str(i)}.png')
+                    print(angle_p_opt.item(),angle_y_opt.item(), angle_r_opt.item())
+                    #if opt_cam and step<600:
+                    optm_c.zero_grad()
+                    loss.backward()
+                    optm_c.step()
+                        
+            
+            if invert_map:
+                
+                result = G.synthesis(w, maps, c)
+                img_rec = result['image']
+            else:
+                if w_type == 'w':
+                    result = G.synthesis(w.repeat(1,14,1), c=c)
+                else:
+                    if opt_cam:
+                        result = G.synthesis(w, c=camera_params)
+                    else:
+                        result = G.synthesis(w, c=c)
+                img_rec = result['image']
+                
+            
                     
 
     
             loss = 0
             loss_vgg=None; loss_id=None; loss_l1=None; loss_vgg_raw=None; loss_id_raw=None; loss_l1_raw=None
-            if 'full' in loss_to:
-                loss_l1 = torch.nn.functional.l1_loss(img_rec, img).mean()
-                loss = loss + loss_l1
-            if 'raw' in loss_to:
-                loss_l1_raw = torch.nn.functional.l1_loss(img_rec_raw, img_raw).mean()
-                loss = loss + loss_l1_raw
+            
+            loss_l1 = torch.nn.functional.l1_loss(img_rec, img).mean()
+            loss = loss + loss_l1
+          
             if 'vgg' in loss_choice:
-                #import pdb;pdb.set_trace()
+             
                 img_rec_mini = torch.nn.functional.interpolate(img_rec,size=(256,256))
                 img_mini = torch.nn.functional.interpolate(img,size=(256,256))
-                if 'full' in loss_to:
-                    
-                    loss_vgg = 1 * criterion_VGG(img_rec_mini, img_mini).mean()
-                    loss = loss + loss_vgg
-                if 'raw' in loss_to:
-                    loss_vgg_raw = 1e-2 * criterion_VGG(img_rec_raw, img_mini).mean()
-                    loss = loss + loss_vgg_raw
-            if 'id' in loss_choice:
-                #import pdb;pdb.set_trace()
-                if 'full' in loss_to:
-                    loss_id = criterion_ID(img, img_rec).mean()
-                    loss = loss + loss_id
-                if 'raw' in loss_to:
-                    loss_id_raw = criterion_ID(img, img_rec_raw).mean()
-                    loss = loss + loss_id_raw
 
-            if step%1000==0:
+                    
+                loss_vgg = 1 * criterion_VGG(img_rec_mini, img_mini).mean()
+                loss = loss + loss_vgg
+                
+            if 'id' in loss_choice:
+           
+                
+                loss_id = criterion_ID(img, img_rec).mean()
+                loss = loss + loss_id
+            
+
+            if step%100==0:
                 #if 'vgg' in loss_choice:
                 print('\n')
-                print(f'Datum name')
+                print(f'Datum name: {datum}')
                 print(f'Step: {step}/Loss(VGG): {loss_vgg}', f'Step: {step}/Loss(L1): {loss_l1}', f'Step: {step}/Loss(ID): {loss_id}')
                 print(f'Step: {step}/Loss(VGG)_raw: {loss_vgg_raw}', f'Step: {step}/Loss(L1)_raw: {loss_l1_raw}', f'Step: {step}/Loss(ID)_raw: {loss_id_raw}')
                 print('\n')
+                
                 imgs_save = []
                 img_save = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
                 img_rec_save = (img_rec.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
@@ -359,9 +431,13 @@ def generate_images(
                     #ws = G.mapping(z, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
                     #import pdb;pdb.set_trace()
                     if invert_map:
-                        img_temp = G.synthesis(w, None, camera_params)['image']
-                    else:
                         img_temp = G.synthesis(w, maps, camera_params)['image']
+                    else:
+                        if w_type == 'w':
+                            img_temp = G.synthesis(w.repeat(1,14,1), None, camera_params)['image']
+                        else:
+                            img_temp = G.synthesis(w, None, camera_params)['image']
+
                     img_temp_save = (img_temp.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
                     imgs_save.append(img_temp_save)
                 #img_save = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
@@ -390,10 +466,13 @@ def generate_images(
                 os.makedirs(f'{outdir}_pickles',exist_ok=True)
                 with open(f'{outdir}_pickles/{datum}.pickle', 'wb') as f:
                     pickle.dump(data, f, pickle.HIGHEST_PROTOCOL)
-
+            
             optm.zero_grad()
             loss.backward()
             optm.step()
+            
+            
+                
             #sche.step()
 
         

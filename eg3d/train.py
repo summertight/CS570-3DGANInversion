@@ -109,7 +109,7 @@ def launch_training(c, desc, outdir, dry_run):
 
 def init_dataset_kwargs(data, mode):
     try:
-        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False) #mode=mode)
+        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False, mode=mode)
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
         dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
         dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
@@ -195,7 +195,7 @@ def parse_comma_separated_list(s):
 @click.option('--density_reg_p_dist',    help='density regularization strength.', metavar='FLOAT', type=click.FloatRange(min=0), default=0.004, required=False, show_default=True)
 @click.option('--reg_type', help='Type of regularization', metavar='STR',  type=click.Choice(['l1', 'l1-alt', 'monotonic-detach', 'monotonic-fixed', 'total-variation']), required=False, default='l1')
 @click.option('--decoder_lr_mul',    help='decoder learning rate multiplier.', metavar='FLOAT', type=click.FloatRange(min=0), default=1, required=False, show_default=True)
-@click.option('--mode', help='autoencoder or eg3d', metavar='STR',  type=click.Choice(['AE', 'EG3D', 'MFIM', 'E_warmup_w+','E_warmup_w++', 'E_warmup_w++_map','AE_new','AE_Platon']), required=True, default='AE')
+@click.option('--mode', help='autoencoder or eg3d', metavar='STR',  type=click.Choice(['AE', 'EG3D', 'MFIM','MFIM_nomaps_warmup', 'E_warmup_w+','E_warmup_w++', 'E_warmup_w++_map','AE_new','AE_Platon','Swap_LIA','Swap_LIA_warmup','pSp_Chain']), required=True, default='AE')
 @click.option('--pretrain', help='autoencoder or eg3d', metavar='STR',  type=str,  default=None)
 #@click.option('--loss_selection', type=click.Choice(['vgg','l1','id', 'gan','deca']), multiple=True)
 @click.option('--loss_selection', type=(str,float) , default =[('l1',1),('deca',5)],multiple=True)
@@ -206,6 +206,7 @@ def parse_comma_separated_list(s):
 @click.option('--lr_e', help='E',   default = 0.0001, type=click.FloatRange(min=0))
 @click.option('--lr_g', help='G',   default = 0.0001,type=click.FloatRange(min=0))
 @click.option('--lr_d', help='D',  default = 0.0001, type=click.FloatRange(min=0))
+@click.option('--start_from_avg', default=False, type=bool)
 #XXX 클릭 옵션은 소문자만 취급
 
 #XXX DEBUG LINE: python train.py --outdir=~/training-runs --cfg=ffhq --data=./inthewild_data --gpus=1 --batch 4 --gamma 1 --gen_pose_cond True --loss_selection l1 --workers 0 --pretrain /home/nas4_user/jaeseonglee/ICCV2023/eg3d_ckpts/eg3d-fixed-triplanes-ffhq.pkl
@@ -238,27 +239,45 @@ def main(**kwargs):
 
     # Initialize config.
     opts = dnnlib.EasyDict(kwargs) # Command line arguments.
+    
     if opts.invert_map:
         assert opts.block_selection!=None
     c = dnnlib.EasyDict() # Main config dict.
+    
+    c.start_from_avg = opts.start_from_avg
+
     c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
     c.D_kwargs = dnnlib.EasyDict(class_name='training.networks_stylegan2.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
     c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
     c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
-    if opts.mode == 'AE' or opts.mode == 'AE_new' or opts.mode == 'AE_Platon':
+
+    if opts.mode == 'AE' or opts.mode == 'AE_new' or opts.mode == 'AE_Platon' or opts.mode =='pSp_Chain':
         c.mode = opts.mode
         c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder',\
                 img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
         c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
         c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2AELoss')
-    elif opts.mode == 'MFIM':
+
+    elif opts.mode == 'Swap_LIA' or opts.mode == 'Swap_LIA_warmup':
         c.mode = opts.mode
-        c.E_kwargs = dnnlib.EasyDict(class_name='training.psp_encoders_cp.GradualStyleEncoder',\
-                img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
+        c.E_kwargs = dnnlib.EasyDict(class_name='training.encoder_LIA.Encoder',\
+                img_resolution=256, dim=512)
         c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
         c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2SwapLoss')
+    
+    elif opts.mode == 'MFIM' or opts.mode == 'MFIM_nomaps_warmup':
+        c.mode = opts.mode
+        if opts.mode == 'MFIM_nomaps_warmup':
+            c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder',\
+                    img_res=256, block_selections = [], w_type = opts.w_type)
+        else:
+            c.E_kwargs = dnnlib.EasyDict(class_name='training.pixel2style2pixel.models.encoders.psp_encoders.GradualStyleEncoder',\
+                    img_res=256, block_selections = list(opts.block_selection), w_type = opts.w_type)
+        c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+        c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2SwapLoss')
+    
     elif opts.mode == 'StyleSWAP':
         c.mode = opts.mode
         c.E_kwargs = dnnlib.EasyDict(class_name='training.psp_encoders_cp.GradualStyleEncoder',\
@@ -266,6 +285,8 @@ def main(**kwargs):
         c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
         
         c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2StyleSwapLoss')
+    
+
     elif opts.mode == 'E_warmup_w+' or opts.mode == 'E_warmup_w++' or opts.mode == 'E_warmup_w++_map':
         c.mode = opts.mode
         c.E_kwargs = dnnlib.EasyDict(class_name='training.psp_encoders_cp.GradualStyleEncoder',\

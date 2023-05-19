@@ -177,10 +177,13 @@ def generate_images(
 
             img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
             imgs.append(img)
+            np.save(f'{outdir}/seed{seed:04d}_{str(angle_y)}',camera_params.cpu().numpy())
+            PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_{str(angle_y)}.png')
 
         img = torch.cat(imgs, dim=2)
 
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
+        np.save(f'{outdir}/seed{seed:04d}',camera_params.cpu().numpy())
 
         if shapes:
             # extract a shape.mrc with marching cubes. You can view the .mrc file using ChimeraX from UCSF.
